@@ -31,6 +31,10 @@ def _default_cache_path() -> Path:
     return Path(DEFAULT_CONFIG["data_cache_dir"]) / "sp500_symbols.csv"
 
 
+def _bundled_symbols_path() -> Path:
+    return Path(__file__).with_name("data") / "sp500_symbols.csv"
+
+
 def _read_cache(path: Path) -> list[str]:
     data = pd.read_csv(path)
     column = data.columns[0]
@@ -65,4 +69,8 @@ def get_sp500_symbols(refresh: bool = False, cache_path: str | None = None) -> l
         if path.exists():
             logger.warning("Falling back to cached S&P 500 constituents from %s", path)
             return _read_cache(path)
+        bundled_path = _bundled_symbols_path()
+        if bundled_path.exists():
+            logger.warning("Falling back to bundled S&P 500 constituents from %s", bundled_path)
+            return _read_cache(bundled_path)
         raise

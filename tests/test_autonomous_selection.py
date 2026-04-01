@@ -89,6 +89,23 @@ class TestAutonomousSelection(unittest.TestCase):
 
         self.assertEqual(symbols, ["BRK-B", "MSFT"])
 
+    def test_sp500_symbols_falls_back_to_bundled_file_when_no_cache_exists(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = Path(tmpdir) / "sp500_symbols.csv"
+            bundled_path = Path(tmpdir) / "bundled_sp500_symbols.csv"
+            pd.DataFrame({"symbol": ["BRK-B", "MSFT"]}).to_csv(bundled_path, index=False)
+
+            with patch(
+                "tradingagents.screeners.universe_builder.requests.get",
+                side_effect=RuntimeError("forbidden"),
+            ), patch(
+                "tradingagents.screeners.universe_builder._bundled_symbols_path",
+                return_value=bundled_path,
+            ):
+                symbols = get_sp500_symbols(refresh=True, cache_path=str(cache_path))
+
+        self.assertEqual(symbols, ["BRK-B", "MSFT"])
+
     def test_worker_merges_held_positions_with_ranked_candidates(self):
         executor = type("Executor", (), {"get_positions": lambda self: [{"symbol": "AAPL", "qty": "5"}]})()
 

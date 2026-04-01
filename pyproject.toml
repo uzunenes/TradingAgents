@@ -41,3 +41,4 @@ include = ["tradingagents*", "cli*"]
 
 [tool.setuptools.package-data]
 cli = ["static/*"]
+tradingagents = ["screeners/data/*.csv"]
