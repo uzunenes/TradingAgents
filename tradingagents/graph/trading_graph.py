@@ -78,21 +78,16 @@ class TradingAgentsGraph:
         if self.callbacks:
             llm_kwargs["callbacks"] = self.callbacks
 
-        deep_client = create_llm_client(
-            provider=self.config["llm_provider"],
-            model=self.config["deep_think_llm"],
-            base_url=self.config.get("backend_url"),
-            **llm_kwargs,
+        self.deep_thinking_llm = self._create_llm(
+            self.config["deep_think_llm"], llm_kwargs
         )
-        quick_client = create_llm_client(
-            provider=self.config["llm_provider"],
-            model=self.config["quick_think_llm"],
-            base_url=self.config.get("backend_url"),
-            **llm_kwargs,
+        self.quick_thinking_llm = self._create_llm(
+            self.config["quick_think_llm"], llm_kwargs
         )
-
-        self.deep_thinking_llm = deep_client.get_llm()
-        self.quick_thinking_llm = quick_client.get_llm()
+        self.role_llms = {
+            role: self._create_llm(model, llm_kwargs)
+            for role, model in self.config.get("role_llm_models", {}).items()
+        }
         
         # Initialize memories
         self.bull_memory = FinancialSituationMemory("bull_memory", self.config)
@@ -112,6 +107,7 @@ class TradingAgentsGraph:
         self.graph_setup = GraphSetup(
             self.quick_thinking_llm,
             self.deep_thinking_llm,
+            self.role_llms,
             self.tool_nodes,
             self.bull_memory,
             self.bear_memory,
@@ -132,6 +128,24 @@ class TradingAgentsGraph:
 
         # Set up the graph
         self.graph = self.graph_setup.setup_graph(selected_analysts)
+
+    def _create_llm(self, model: str, llm_kwargs: Dict[str, Any]):
+        client = create_llm_client(
+            provider=self.config["llm_provider"],
+            model=model,
+            base_url=self.config.get("backend_url"),
+            **llm_kwargs,
+        )
+        return client.get_llm()
+
+    def _build_llm_trace(self) -> Dict[str, Any]:
+        return {
+            "provider": self.config.get("llm_provider"),
+            "backend_url": self.config.get("backend_url"),
+            "quick_model": self.config.get("quick_think_llm"),
+            "deep_model": self.config.get("deep_think_llm"),
+            "role_models": self.config.get("role_llm_models", {}),
+        }
 
     def _get_provider_kwargs(self) -> Dict[str, Any]:
         """Get provider-specific kwargs for LLM client creation."""
@@ -231,6 +245,7 @@ class TradingAgentsGraph:
         self.log_states_dict[str(trade_date)] = {
             "company_of_interest": final_state["company_of_interest"],
             "trade_date": final_state["trade_date"],
+            "llm_config": self._build_llm_trace(),
             "market_report": final_state["market_report"],
             "sentiment_report": final_state["sentiment_report"],
             "news_report": final_state["news_report"],

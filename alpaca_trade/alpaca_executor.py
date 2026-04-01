@@ -63,26 +63,51 @@ class AlpacaExecutor:
 
         Returns order dict on success, None if skipped/disabled.
         """
+        result = self.execute_with_details(ticker, signal)
+        return result.get("order")
+
+    def execute_with_details(self, ticker: str, signal: str) -> dict:
+        """Execute a trade and return structured status for logging/UI."""
         signal = signal.strip().upper()
         ticker = ticker.strip().upper()
 
         if not self.trading_enabled:
             logger.info("[DISABLED] Trading disabled. Signal=%s ticker=%s", signal, ticker)
-            return None
+            return {
+                "status": "skipped",
+                "reason": "trading_disabled",
+                "ticker": ticker,
+                "signal": signal,
+                "order": None,
+            }
 
         if ticker in self._traded_today:
             logger.info("[SKIP] Already traded %s today.", ticker)
-            return None
+            return {
+                "status": "skipped",
+                "reason": "already_traded_today",
+                "ticker": ticker,
+                "signal": signal,
+                "order": None,
+            }
 
         if signal in self.BUY_SIGNALS:
-            result = self._submit_order(ticker, side="buy")
+            side = "buy"
         elif signal in self.SELL_SIGNALS:
             # Close any existing long position first, then open short
             self._close_position(ticker)
-            result = self._submit_order(ticker, side="sell")
+            side = "sell"
         else:
             logger.info("[HOLD] No action for signal=%s ticker=%s", signal, ticker)
-            return None
+            return {
+                "status": "skipped",
+                "reason": "hold_signal",
+                "ticker": ticker,
+                "signal": signal,
+                "order": None,
+            }
+
+        result, error = self._submit_order_with_status(ticker, side=side)
 
         if result:
             self._traded_today.add(ticker)
@@ -94,7 +119,23 @@ class AlpacaExecutor:
                 result.get("id"),
                 result.get("status"),
             )
-        return result
+            return {
+                "status": "ordered",
+                "reason": result.get("status", "submitted"),
+                "ticker": ticker,
+                "signal": signal,
+                "side": side,
+                "order": result,
+            }
+
+        return {
+            "status": "rejected",
+            "reason": error or "order_submission_failed",
+            "ticker": ticker,
+            "signal": signal,
+            "side": side,
+            "order": None,
+        }
 
     def reset_daily_guard(self) -> None:
         """Call at the start of each trading day to allow fresh trades."""
@@ -114,6 +155,10 @@ class AlpacaExecutor:
     # ------------------------------------------------------------------
 
     def _submit_order(self, ticker: str, side: str) -> Optional[dict]:
+        result, _ = self._submit_order_with_status(ticker, side)
+        return result
+
+    def _submit_order_with_status(self, ticker: str, side: str) -> tuple[Optional[dict], Optional[str]]:
         """Submit a notional market order."""
         payload = {
             "symbol": ticker,
@@ -130,13 +175,14 @@ class AlpacaExecutor:
                 timeout=15,
             )
             resp.raise_for_status()
-            return resp.json()
+            return resp.json(), None
         except requests.HTTPError as exc:
-            logger.error("[ORDER FAILED] %s %s: %s", side, ticker, exc.response.text[:300])
-            return None
+            message = exc.response.text[:300]
+            logger.error("[ORDER FAILED] %s %s: %s", side, ticker, message)
+            return None, message
         except Exception as exc:
             logger.error("[ORDER ERROR] %s %s: %s", side, ticker, exc)
-            return None
+            return None, str(exc)
 
     def _close_position(self, ticker: str) -> None:
         """Close an open position if it exists (ignore 404)."""

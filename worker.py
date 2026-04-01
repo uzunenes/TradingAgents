@@ -6,15 +6,22 @@ Runs daily after NYSE close (16:05 ET = 21:05 UTC) and:
   2. Sends executable orders to Alpaca paper account via AlpacaExecutor
 
 Configuration via environment variables:
-  OPENROUTER_API_KEY          required
+    LLM_PROVIDER                optional (openai/google/anthropic/xai/openrouter/ollama)
+    BACKEND_URL                 optional custom provider base URL
+    OPENAI_API_KEY              optional when using OpenAI
+    GOOGLE_API_KEY              optional when using Google
+    ANTHROPIC_API_KEY           optional when using Anthropic
+    XAI_API_KEY                 optional when using xAI
+    OPENROUTER_API_KEY          optional when using OpenRouter
   ALPACA_API_KEY              required
   ALPACA_SECRET_KEY           required
   ALPACA_BASE_URL             optional (default: paper endpoint)
   TICKERS                     comma-separated list (default: SPY)
   TRADING_ENABLED             true/false (default: true)
   MAX_ORDER_VALUE_USD         per-order notional cap (default: 500)
-  QUICK_MODEL                 OpenRouter model id (default: z-ai/glm-5-turbo)
-  DEEP_MODEL                  OpenRouter model id (default: z-ai/glm-5)
+    QUICK_MODEL                 provider model id for quick tasks
+    DEEP_MODEL                  provider model id for complex reasoning
+        FUNDAMENTALS_MODEL          optional model override for fundamentals analyst
   SCHEDULE_HOUR_UTC           UTC hour to run (default: 21)
   SCHEDULE_MINUTE_UTC         UTC minute to run (default: 5)
   LOG_LEVEL                   DEBUG/INFO/WARNING (default: INFO)
@@ -124,6 +131,7 @@ def _build_telegram_summary(
     run_results: list[dict],
     account: dict,
     positions: list[dict],
+    llm_settings: dict,
 ) -> str:
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -135,20 +143,24 @@ def _build_telegram_summary(
         f"Tickerlar: {', '.join(tickers)}",
         "",
         "Agentlar / Modeller / Gorevler",
-        "- market -> QUICK_MODEL (hizli piyasa yorumu)",
-        "- social -> QUICK_MODEL (sosyal duyarlilik)",
-        "- news -> QUICK_MODEL (haber etkisi)",
-        "- fundamentals -> DEEP_MODEL (derin finansal analiz)",
-        f"QUICK_MODEL: {os.environ.get('QUICK_MODEL', 'z-ai/glm-5-turbo')}",
-        f"DEEP_MODEL: {os.environ.get('DEEP_MODEL', 'z-ai/glm-5')}",
+        "- market/social/news/bull/bear/trader/risk -> QUICK_MODEL",
+        "- fundamentals -> FUNDAMENTALS_MODEL",
+        "- research_manager/portfolio_manager -> DEEP_MODEL",
+        f"LLM_PROVIDER: {llm_settings['provider']}",
+        f"BACKEND_URL: {llm_settings['backend_url']}",
+        f"QUICK_MODEL: {llm_settings['quick_model']}",
+        f"FUNDAMENTALS_MODEL: {llm_settings['fundamentals_model']}",
+        f"DEEP_MODEL: {llm_settings['deep_model']}",
         "",
         "Onemli kararlar / Sonuclar",
     ]
 
     for item in run_results:
         action = item.get("action", "NO_ACTION")
+        reason = item.get("reason")
+        reason_suffix = f" reason={reason}" if reason else ""
         lines.append(
-            f"- {item.get('ticker')}: signal={item.get('signal')} action={action}"
+            f"- {item.get('ticker')}: signal={item.get('signal')} action={action}{reason_suffix} log={item.get('log_path', 'n/a')}"
         )
 
     lines.extend(
@@ -181,14 +193,58 @@ def _build_telegram_summary(
 # Lazy-import heavy deps (LangGraph, yfinance, etc.) only when job runs
 # ---------------------------------------------------------------------------
 
+def _resolve_llm_settings() -> dict:
+    from tradingagents.default_config import DEFAULT_CONFIG
+
+    env_provider = os.environ.get("LLM_PROVIDER", "").strip().lower()
+    env_backend_url = os.environ.get("BACKEND_URL", "").strip()
+
+    if env_provider:
+        provider = env_provider
+    elif os.environ.get("OPENROUTER_API_KEY", "").strip():
+        provider = "openrouter"
+    else:
+        provider = DEFAULT_CONFIG["llm_provider"]
+
+    if env_backend_url:
+        backend_url = env_backend_url
+    elif provider == "openrouter":
+        backend_url = "https://openrouter.ai/api/v1"
+    else:
+        backend_url = DEFAULT_CONFIG.get("backend_url")
+
+    default_quick_model = DEFAULT_CONFIG["quick_think_llm"]
+    default_deep_model = DEFAULT_CONFIG["deep_think_llm"]
+    default_fundamentals_model = default_deep_model
+
+    if provider == "openrouter":
+        default_quick_model = "anthropic/claude-sonnet-4.6"
+        default_deep_model = "openai/gpt-5.4"
+        default_fundamentals_model = "google/gemini-3.1-pro-preview"
+
+    return {
+        "provider": provider,
+        "backend_url": backend_url,
+        "quick_model": os.environ.get("QUICK_MODEL", default_quick_model),
+        "fundamentals_model": os.environ.get(
+            "FUNDAMENTALS_MODEL", default_fundamentals_model
+        ),
+        "deep_model": os.environ.get("DEEP_MODEL", default_deep_model),
+    }
+
 def _build_ta_config() -> dict:
     from tradingagents.default_config import DEFAULT_CONFIG
 
+    llm_settings = _resolve_llm_settings()
+
     cfg = DEFAULT_CONFIG.copy()
-    cfg["llm_provider"] = "openrouter"
-    cfg["backend_url"] = "https://openrouter.ai/api/v1"
-    cfg["quick_think_llm"] = os.environ.get("QUICK_MODEL", "z-ai/glm-5-turbo")
-    cfg["deep_think_llm"] = os.environ.get("DEEP_MODEL", "z-ai/glm-5")
+    cfg["llm_provider"] = llm_settings["provider"]
+    cfg["backend_url"] = llm_settings["backend_url"]
+    cfg["quick_think_llm"] = llm_settings["quick_model"]
+    cfg["deep_think_llm"] = llm_settings["deep_model"]
+    cfg["role_llm_models"] = {
+        "fundamentals": llm_settings["fundamentals_model"],
+    }
     cfg["max_debate_rounds"] = 1
     cfg["max_risk_discuss_rounds"] = 1
     cfg["data_vendors"] = {
@@ -225,8 +281,16 @@ def trading_job() -> None:
     tickers_raw = os.environ.get("TICKERS", "SPY")
     tickers = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()]
     today = date.today().isoformat()
+    llm_settings = _resolve_llm_settings()
 
     logger.info("=== Trading job started: date=%s tickers=%s ===", today, tickers)
+    logger.info(
+        "LLM routing: provider=%s quick=%s fundamentals=%s deep=%s",
+        llm_settings["provider"],
+        llm_settings["quick_model"],
+        llm_settings["fundamentals_model"],
+        llm_settings["deep_model"],
+    )
 
     executor = AlpacaExecutor()
     notifier = TelegramNotifier()
@@ -250,6 +314,11 @@ def trading_job() -> None:
         logger.info("Analysing %s ...", ticker)
         retries = 3
         signal = "HOLD"
+        analysis_error = ""
+        log_path = (
+            f"eval_results/{ticker}/TradingAgentsStrategy_logs/"
+            f"full_states_log_{today}.json"
+        )
         for attempt in range(retries):
             try:
                 signal = _run_analysis(ticker, today)
@@ -257,6 +326,7 @@ def trading_job() -> None:
                 break
             except Exception as exc:
                 err = str(exc)
+                analysis_error = err[:300]
                 logger.warning(
                     "Analysis attempt %d/%d failed for %s: %s",
                     attempt + 1,
@@ -267,7 +337,8 @@ def trading_job() -> None:
                 if attempt < retries - 1:
                     time.sleep(3 * (attempt + 1))
 
-        order = executor.execute(ticker, signal)
+        execution = executor.execute_with_details(ticker, signal)
+        order = execution.get("order")
         if order:
             logger.info("Order placed: %s", order)
             run_results.append(
@@ -275,15 +346,27 @@ def trading_job() -> None:
                     "ticker": ticker,
                     "signal": signal,
                     "action": f"ORDER_{order.get('side', '').upper()}",
+                    "reason": execution.get("reason"),
+                    "log_path": log_path,
                 }
             )
         else:
-            logger.info("No order placed for %s (signal=%s)", ticker, signal)
+            reason = execution.get("reason")
+            if analysis_error and signal == "HOLD":
+                reason = f"analysis_failed_then_default_hold: {analysis_error}"
+            logger.info(
+                "No order placed for %s (signal=%s, reason=%s)",
+                ticker,
+                signal,
+                reason,
+            )
             run_results.append(
                 {
                     "ticker": ticker,
                     "signal": signal,
-                    "action": "HOLD_OR_SKIPPED",
+                    "action": execution.get("status", "HOLD_OR_SKIPPED").upper(),
+                    "reason": reason,
+                    "log_path": log_path,
                 }
             )
 
@@ -301,6 +384,7 @@ def trading_job() -> None:
             run_results=run_results,
             account=account_end,
             positions=positions_end,
+            llm_settings=llm_settings,
         )
         logger.info(
             "Telegram summary prepared: size=%d bytes, tickers=%s, results=%d",

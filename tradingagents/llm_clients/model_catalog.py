@@ -65,10 +65,15 @@ MODEL_OPTIONS: ProviderModeOptions = {
     },
     "openrouter": {
         "quick": [
+            ("Claude Sonnet 4.6 - Best agentic balance via OpenRouter", "anthropic/claude-sonnet-4.6"),
+            ("GPT-5.4 Mini - Fast frontier fallback via OpenRouter", "openai/gpt-5.4-mini"),
             ("NVIDIA Nemotron 3 Nano 30B (free)", "nvidia/nemotron-3-nano-30b-a3b:free"),
             ("Z.AI GLM 4.5 Air (free)", "z-ai/glm-4.5-air:free"),
         ],
         "deep": [
+            ("GPT-5.4 - Strongest synthesis via OpenRouter", "openai/gpt-5.4"),
+            ("Gemini 3.1 Pro Preview - Deep research via OpenRouter", "google/gemini-3.1-pro-preview"),
+            ("Claude Sonnet 4.6 - Strong all-round fallback via OpenRouter", "anthropic/claude-sonnet-4.6"),
             ("Z.AI GLM 4.5 Air (free)", "z-ai/glm-4.5-air:free"),
             ("NVIDIA Nemotron 3 Nano 30B (free)", "nvidia/nemotron-3-nano-30b-a3b:free"),
         ],
