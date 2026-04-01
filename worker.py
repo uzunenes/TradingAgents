@@ -22,6 +22,7 @@ Configuration via environment variables:
     QUICK_MODEL                 provider model id for quick tasks
     DEEP_MODEL                  provider model id for complex reasoning
         FUNDAMENTALS_MODEL          optional model override for fundamentals analyst
+    RUN_ON_START                true/false to execute one cloud-side scan on service boot
   SCHEDULE_HOUR_UTC           UTC hour to run (default: 21)
   SCHEDULE_MINUTE_UTC         UTC minute to run (default: 5)
   LOG_LEVEL                   DEBUG/INFO/WARNING (default: INFO)
@@ -405,11 +406,24 @@ def trading_job() -> None:
     logger.info("=== Trading job finished ===")
 
 
+def _maybe_run_startup_trigger() -> None:
+    if os.environ.get("RUN_ON_START", "false").lower() != "true":
+        return
+
+    logger.info("Startup one-shot execution triggered via RUN_ON_START=true.")
+    try:
+        trading_job()
+    except Exception as exc:
+        logger.error("Startup one-shot execution failed: %s", exc, exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # Scheduler setup
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    _maybe_run_startup_trigger()
+
     hour = int(os.environ.get("SCHEDULE_HOUR_UTC", "21"))
     minute = int(os.environ.get("SCHEDULE_MINUTE_UTC", "5"))
 
