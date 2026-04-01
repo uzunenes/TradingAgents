@@ -55,3 +55,53 @@ class TestWorkerPortfolioManagement(unittest.TestCase):
         run_results = summaries[0]["run_results"]
         self.assertEqual(run_results[0]["action"], "ORDER_BUY")
         self.assertEqual(run_results[1]["reason"], "buy_budget_reached")
+
+    def test_telegram_summary_is_explicit_about_actions_and_portfolio(self):
+        summary = worker._build_telegram_summary(
+            run_date="2026-04-01",
+            session_name="midday",
+            run_id="run-123",
+            tickers=["SPY", "MSFT"],
+            discovery_context={
+                "universe_mode": "sp500",
+                "ranked_candidates": [{"symbol": "MSFT", "score": 0.73}],
+                "held_symbols": ["AAPL"],
+                "used_explicit_fallback": False,
+            },
+            run_results=[
+                {
+                    "ticker": "SPY",
+                    "signal": "SELL",
+                    "action": "REJECTED",
+                    "reason": "no_long_position_to_reduce",
+                    "log_path": "eval_results/SPY/log.json",
+                },
+                {
+                    "ticker": "MSFT",
+                    "signal": "BUY",
+                    "action": "ORDER_BUY",
+                    "reason": "accepted",
+                    "log_path": "eval_results/MSFT/log.json",
+                },
+            ],
+            account={
+                "status": "ACTIVE",
+                "equity": "10000",
+                "cash": "5000",
+                "buying_power": "15000",
+                "portfolio_value": "10000",
+            },
+            positions=[{"symbol": "MSFT", "qty": "2", "market_value": "800"}],
+            llm_settings={
+                "provider": "openrouter",
+                "backend_url": "https://openrouter.ai/api/v1",
+                "quick_model": "q",
+                "fundamentals_model": "f",
+                "deep_model": "d",
+            },
+        )
+
+        self.assertIn("Run Ozeti", summary)
+        self.assertIn("portfoyden dahil edilenler: AAPL", summary)
+        self.assertIn("aksiyon=alim emri gonderildi", summary)
+        self.assertIn("neden=azaltilacak long pozisyon yok, short acilmadi", summary)

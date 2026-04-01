@@ -58,6 +58,8 @@ class TestIntradayWorkerHelpers(unittest.TestCase):
 
         self.assertEqual(payload["status"], "ok")
         self.assertIn("run_state", payload)
+        self.assertIn("active", payload["run_state"])
+        self.assertIn("last_status", payload["run_state"])
 
     def test_http_trigger_endpoint_accepts_background_run(self):
         with patch.object(
@@ -83,3 +85,30 @@ class TestIntradayWorkerHelpers(unittest.TestCase):
 
         self.assertEqual(status_code, 202)
         self.assertEqual(payload["status"], "accepted")
+
+    def test_health_payload_is_flat_and_stable(self):
+        with patch.object(
+            worker,
+            "_snapshot_run_state",
+            return_value={
+                "active": True,
+                "current": {
+                    "session_name": "midday",
+                    "trigger_source": "scheduler",
+                    "started_at": "2026-04-01T17:00:00Z",
+                },
+                "last": {
+                    "status": "completed",
+                    "reason": None,
+                    "session_name": "open",
+                    "trigger_source": "scheduler",
+                    "started_at": "2026-04-01T14:00:00Z",
+                    "finished_at": "2026-04-01T14:20:00Z",
+                },
+            },
+        ):
+            payload = worker._build_health_payload()
+
+        self.assertTrue(payload["run_state"]["active"])
+        self.assertEqual(payload["run_state"]["current_session_name"], "midday")
+        self.assertEqual(payload["run_state"]["last_status"], "completed")

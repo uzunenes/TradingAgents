@@ -207,6 +207,56 @@ def _fmt_money(value: Optional[str]) -> str:
         return str(value)
 
 
+def _humanize_reason(reason: Optional[str]) -> str:
+    reason_map = {
+        "accepted": "emir kabul edildi",
+        "buy_budget_reached": "bu seanstaki yeni alim limiti doldu",
+        "already_holding_long": "zaten long pozisyon var, ek alim yapilmadi",
+        "no_long_position_to_reduce": "azaltilacak long pozisyon yok, short acilmadi",
+        "hold_signal": "hold sinyali geldi",
+        "trading_disabled": "trading kapali",
+        "already_traded_in_run": "bu seans icinde zaten islem yapildi",
+        "order_submission_failed": "emir gonderimi basarisiz",
+    }
+    if reason is None:
+        return "neden yok"
+    return reason_map.get(reason, str(reason))
+
+
+def _humanize_action(action: Optional[str]) -> str:
+    action_map = {
+        "ORDER_BUY": "alim emri gonderildi",
+        "ORDER_SELL": "satis emri gonderildi",
+        "SKIPPED": "islem atlandi",
+        "REJECTED": "islem reddedildi",
+    }
+    if action is None:
+        return "aksiyon yok"
+    return action_map.get(action, action.lower())
+
+
+def _summarize_run_results(run_results: list[dict]) -> dict:
+    summary = {
+        "buy_orders": 0,
+        "sell_orders": 0,
+        "skipped": 0,
+        "rejected": 0,
+    }
+    for item in run_results:
+        action = (item.get("action") or "").upper()
+        if action == "ORDER_BUY":
+            summary["buy_orders"] += 1
+        elif action == "ORDER_SELL":
+            summary["sell_orders"] += 1
+        elif action == "SKIPPED":
+            summary["skipped"] += 1
+        elif action == "REJECTED":
+            summary["rejected"] += 1
+        else:
+            summary["skipped"] += 1
+    return summary
+
+
 def _build_telegram_summary(
     run_date: str,
     session_name: str,
@@ -219,6 +269,7 @@ def _build_telegram_summary(
     llm_settings: dict,
 ) -> str:
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    result_summary = _summarize_run_results(run_results)
 
     lines = [
         "TradingAgents Gunluk Ozet",
@@ -228,7 +279,13 @@ def _build_telegram_summary(
         f"Calisma kimligi: {run_id}",
         f"Rapor zamani: {now_utc}",
         f"Evren modu: {discovery_context.get('universe_mode', 'fixed')}",
-        f"Tickerlar: {', '.join(tickers)}",
+        f"Incelenen tickerlar ({len(tickers)}): {', '.join(tickers)}",
+        "",
+        "Run Ozeti",
+        f"- yeni alim emirleri: {result_summary['buy_orders']}",
+        f"- satis/azaltim emirleri: {result_summary['sell_orders']}",
+        f"- atlanan kararlar: {result_summary['skipped']}",
+        f"- reddedilen kararlar: {result_summary['rejected']}",
         "",
         "Agentlar / Modeller / Gorevler",
         "- market/social/news/bull/bear/trader/risk -> QUICK_MODEL",
@@ -247,30 +304,38 @@ def _build_telegram_summary(
     held_symbols = discovery_context.get("held_symbols", [])
     if ranked_candidates:
         lines.append(
-            "- screened: "
+            "- sp500 adaylari: "
             + ", ".join(
                 f"{item['symbol']}({item['score']:.3f})"
                 for item in ranked_candidates[:8]
             )
         )
+    else:
+        lines.append("- sp500 adaylari: yok")
     if held_symbols:
-        lines.append(f"- held: {', '.join(held_symbols)}")
+        lines.append(f"- portfoyden dahil edilenler: {', '.join(held_symbols)}")
+    else:
+        lines.append("- portfoyden dahil edilenler: yok")
     if discovery_context.get("used_explicit_fallback"):
-        lines.append("- fallback: explicit TICKERS env used after screener failure")
+        lines.append("- fallback kullanildi: screener hata verdi, TICKERS listesine donuldu")
 
     lines.extend(
         [
         "",
-        "Onemli kararlar / Sonuclar",
+        "Ticker Bazli Kararlar",
         ]
     )
 
     for item in run_results:
         action = item.get("action", "NO_ACTION")
         reason = item.get("reason")
-        reason_suffix = f" reason={reason}" if reason else ""
         lines.append(
-            f"- {item.get('ticker')}: signal={item.get('signal')} action={action}{reason_suffix} log={item.get('log_path', 'n/a')}"
+            "- "
+            f"{item.get('ticker')}: "
+            f"sinyal={item.get('signal')} | "
+            f"aksiyon={_humanize_action(action)} | "
+            f"neden={_humanize_reason(reason)} | "
+            f"log={item.get('log_path', 'n/a')}"
         )
 
     lines.extend(
@@ -283,12 +348,12 @@ def _build_telegram_summary(
             f"- buying_power: {_fmt_money(account.get('buying_power'))}",
             f"- portfolio_value: {_fmt_money(account.get('portfolio_value'))}",
             "",
-            "Acilik Pozisyonlar",
+            "Portfoy Son Durum",
         ]
     )
 
     if not positions:
-        lines.append("- pozisyon yok")
+        lines.append("- acik pozisyon yok")
     else:
         for pos in positions[:8]:
             lines.append(
@@ -568,11 +633,25 @@ def _get_http_port() -> int:
 
 
 def _build_health_payload() -> dict:
+    run_state = _snapshot_run_state()
+    current = run_state.get("current") or {}
+    last = run_state.get("last") or {}
     return {
         "status": "ok",
         "scheduler_enabled": _get_env_bool("SCHEDULER_ENABLED", True),
         "http_trigger_enabled": _is_http_trigger_enabled(),
-        "run_state": _snapshot_run_state(),
+        "run_state": {
+            "active": run_state.get("active", False),
+            "current_session_name": current.get("session_name"),
+            "current_trigger_source": current.get("trigger_source"),
+            "current_started_at": current.get("started_at"),
+            "last_status": last.get("status"),
+            "last_reason": last.get("reason"),
+            "last_session_name": last.get("session_name"),
+            "last_trigger_source": last.get("trigger_source"),
+            "last_started_at": last.get("started_at"),
+            "last_finished_at": last.get("finished_at"),
+        },
     }
 
 
