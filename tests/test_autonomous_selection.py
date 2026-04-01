@@ -1,8 +1,9 @@
 import os
+import tempfile
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pandas as pd
 
@@ -45,6 +46,48 @@ class TestAutonomousSelection(unittest.TestCase):
 
         self.assertEqual([item["symbol"] for item in ranked], ["AAA", "BBB"])
         self.assertGreater(ranked[0]["score"], ranked[1]["score"])
+
+    def test_sp500_symbols_fetches_with_browser_headers_and_caches(self):
+        html = """
+        <table>
+            <thead><tr><th>Symbol</th></tr></thead>
+            <tbody>
+                <tr><td>BRK.B</td></tr>
+                <tr><td>MSFT</td></tr>
+            </tbody>
+        </table>
+        """
+        response = Mock()
+        response.text = html
+        response.raise_for_status.return_value = None
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "tradingagents.screeners.universe_builder.requests.get",
+            return_value=response,
+        ) as mock_get:
+            cache_path = Path(tmpdir) / "sp500_symbols.csv"
+
+            symbols = get_sp500_symbols(refresh=True, cache_path=str(cache_path))
+
+            self.assertEqual(symbols, ["BRK-B", "MSFT"])
+            self.assertTrue(cache_path.exists())
+            self.assertEqual(get_sp500_symbols(cache_path=str(cache_path)), ["BRK-B", "MSFT"])
+
+        _, kwargs = mock_get.call_args
+        self.assertIn("Mozilla/5.0", kwargs["headers"]["User-Agent"])
+
+    def test_sp500_symbols_falls_back_to_cache_when_fetch_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = Path(tmpdir) / "sp500_symbols.csv"
+            pd.DataFrame({"symbol": ["BRK-B", "MSFT"]}).to_csv(cache_path, index=False)
+
+            with patch(
+                "tradingagents.screeners.universe_builder.requests.get",
+                side_effect=RuntimeError("forbidden"),
+            ):
+                symbols = get_sp500_symbols(refresh=True, cache_path=str(cache_path))
+
+        self.assertEqual(symbols, ["BRK-B", "MSFT"])
 
     def test_worker_merges_held_positions_with_ranked_candidates(self):
         executor = type("Executor", (), {"get_positions": lambda self: [{"symbol": "AAPL", "qty": "5"}]})()
