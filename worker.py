@@ -19,9 +19,11 @@ Configuration via environment variables:
   TICKERS                     comma-separated list (default: SPY)
     UNIVERSE_MODE               fixed/sp500 (default: fixed)
     SCREEN_TOP_N                ranked candidate count for sp500 mode (default: 8)
+    SCREEN_CANDIDATE_POOL       numeric prefilter pool size before agentic selection (default: SCREEN_TOP_N or 20 when enabled)
     SCREEN_LOOKBACK_DAYS        lookback window for screener metrics (default: 180)
     SCREEN_BATCH_SIZE           batch size for yfinance downloads (default: 100)
     MIN_AVG_DOLLAR_VOLUME_USD   liquidity floor for screener (default: 50000000)
+    AGENTIC_SELECTION_ENABLED   true/false use quick-model selector on ranked candidate pool (default: true)
     PORTFOLIO_INCLUDE_OPEN_POSITIONS  true/false include current positions in analysis set
     MAX_NEW_BUYS_PER_RUN        cap new entries per session (default: 3)
   TRADING_ENABLED             true/false (default: true)
@@ -301,17 +303,31 @@ def _build_telegram_summary(
     ]
 
     ranked_candidates = discovery_context.get("ranked_candidates", [])
+    selected_candidates = discovery_context.get("selected_candidates", [])
     held_symbols = discovery_context.get("held_symbols", [])
     if ranked_candidates:
         lines.append(
-            "- sp500 adaylari: "
+            "- sayisal havuz: "
             + ", ".join(
                 f"{item['symbol']}({item['score']:.3f})"
                 for item in ranked_candidates[:8]
             )
         )
     else:
-        lines.append("- sp500 adaylari: yok")
+        lines.append("- sayisal havuz: yok")
+    if selected_candidates:
+        lines.append(
+            "- agent secimi: "
+            + ", ".join(
+                f"{item['symbol']}({item['score']:.3f})"
+                for item in selected_candidates[:8]
+            )
+        )
+    elif ranked_candidates:
+        lines.append("- agent secimi: devre disi veya gerekli degil")
+    selection_reason = (discovery_context.get("selection_reason") or "").strip()
+    if selection_reason:
+        lines.append(f"- agent notu: {selection_reason}")
     if held_symbols:
         lines.append(f"- portfoyden dahil edilenler: {', '.join(held_symbols)}")
     else:
@@ -440,7 +456,9 @@ def _get_open_position_tickers(executor) -> list[str]:
 def _discover_market_candidates(trade_date: str) -> list[dict]:
     from tradingagents.screeners.ranker import rank_sp500_candidates
 
-    top_n = _get_env_int("SCREEN_TOP_N", 8)
+    screen_top_n = _get_env_int("SCREEN_TOP_N", 8)
+    default_pool = max(screen_top_n, 20) if _get_env_bool("AGENTIC_SELECTION_ENABLED", True) else screen_top_n
+    top_n = _get_env_int("SCREEN_CANDIDATE_POOL", default_pool)
     lookback_days = _get_env_int("SCREEN_LOOKBACK_DAYS", 180)
     batch_size = _get_env_int("SCREEN_BATCH_SIZE", 100)
     min_avg_dollar_volume = _get_env_float("MIN_AVG_DOLLAR_VOLUME_USD", 50000000)
@@ -451,6 +469,48 @@ def _discover_market_candidates(trade_date: str) -> list[dict]:
         batch_size=batch_size,
         min_avg_dollar_volume=min_avg_dollar_volume,
     )
+
+
+def _select_market_candidates(
+    ranked_candidates: list[dict],
+    held_symbols: list[str],
+    trade_date: str,
+) -> dict:
+    target_count = _get_env_int("SCREEN_TOP_N", 8)
+    if not ranked_candidates:
+        return {
+            "selected_candidates": [],
+            "selection_reason": "no_ranked_candidates",
+            "agentic_selection_enabled": _get_env_bool("AGENTIC_SELECTION_ENABLED", True),
+        }
+
+    if not _get_env_bool("AGENTIC_SELECTION_ENABLED", True):
+        return {
+            "selected_candidates": ranked_candidates[:target_count],
+            "selection_reason": "agentic_selection_disabled",
+            "agentic_selection_enabled": False,
+        }
+
+    try:
+        from tradingagents.screeners.selector_agent import select_candidates_with_llm
+
+        llm_settings = _resolve_llm_settings()
+        selection = select_candidates_with_llm(
+            ranked_candidates=ranked_candidates,
+            held_symbols=held_symbols,
+            trade_date=trade_date,
+            llm_settings=llm_settings,
+            selection_count=min(target_count, len(ranked_candidates)),
+        )
+        selection["agentic_selection_enabled"] = True
+        return selection
+    except Exception as exc:
+        logger.warning("Agentic selector failed, using numeric ranking order: %s", exc)
+        return {
+            "selected_candidates": ranked_candidates[:target_count],
+            "selection_reason": f"agentic_selector_failed: {exc}",
+            "agentic_selection_enabled": True,
+        }
 
 
 def _merge_ticker_lists(primary: list[str], secondary: list[str]) -> list[str]:
@@ -478,11 +538,16 @@ def _resolve_analysis_tickers(executor, trade_date: str) -> tuple[list[str], dic
     held_symbols = _get_open_position_tickers(executor)
     try:
         ranked_candidates = _discover_market_candidates(trade_date)
-        candidate_symbols = [item["symbol"] for item in ranked_candidates]
+        selection = _select_market_candidates(ranked_candidates, held_symbols, trade_date)
+        selected_candidates = selection.get("selected_candidates", ranked_candidates)
+        candidate_symbols = [item["symbol"] for item in selected_candidates]
         tickers = _merge_ticker_lists(held_symbols, candidate_symbols)
         return tickers, {
             "universe_mode": "sp500",
             "ranked_candidates": ranked_candidates,
+            "selected_candidates": selected_candidates,
+            "selection_reason": selection.get("selection_reason", ""),
+            "agentic_selection_enabled": selection.get("agentic_selection_enabled", False),
             "held_symbols": held_symbols,
             "used_explicit_fallback": False,
         }
@@ -492,6 +557,9 @@ def _resolve_analysis_tickers(executor, trade_date: str) -> tuple[list[str], dic
         return tickers, {
             "universe_mode": "sp500",
             "ranked_candidates": [],
+            "selected_candidates": [],
+            "selection_reason": "",
+            "agentic_selection_enabled": _get_env_bool("AGENTIC_SELECTION_ENABLED", True),
             "held_symbols": held_symbols,
             "used_explicit_fallback": True,
         }

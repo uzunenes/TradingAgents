@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import worker
 from tradingagents.screeners.ranker import rank_candidates_from_histories
+from tradingagents.screeners.selector_agent import select_candidates_with_llm
 from tradingagents.screeners.universe_builder import get_sp500_symbols
 
 
@@ -119,3 +120,75 @@ class TestAutonomousSelection(unittest.TestCase):
         self.assertEqual(tickers, ["AAPL", "MSFT", "NVDA"])
         self.assertEqual(context["held_symbols"], ["AAPL"])
         self.assertFalse(context["used_explicit_fallback"])
+
+    def test_selector_agent_chooses_valid_symbols(self):
+        fake_llm = Mock()
+        fake_llm.invoke.return_value = type(
+            "Response",
+            (),
+            {"content": '{"selected_symbols": ["NVDA", "MSFT"], "selection_reason": "higher quality setup"}'},
+        )()
+
+        fake_client = Mock()
+        fake_client.get_llm.return_value = fake_llm
+
+        ranked_candidates = [
+            {"symbol": "MSFT", "score": 0.8, "ret_20": 0.1, "ret_60": 0.2, "volatility_20": 0.3, "avg_dollar_volume": 1e8, "latest_close": 400},
+            {"symbol": "NVDA", "score": 0.75, "ret_20": 0.15, "ret_60": 0.25, "volatility_20": 0.4, "avg_dollar_volume": 2e8, "latest_close": 150},
+            {"symbol": "AMZN", "score": 0.7, "ret_20": 0.12, "ret_60": 0.18, "volatility_20": 0.28, "avg_dollar_volume": 9e7, "latest_close": 180},
+        ]
+
+        with patch("tradingagents.screeners.selector_agent.create_llm_client", return_value=fake_client):
+            result = select_candidates_with_llm(
+                ranked_candidates=ranked_candidates,
+                held_symbols=["AAPL"],
+                trade_date="2026-04-01",
+                llm_settings={
+                    "provider": "openrouter",
+                    "backend_url": "https://openrouter.ai/api/v1",
+                    "quick_model": "anthropic/claude-sonnet-4.6",
+                },
+                selection_count=2,
+            )
+
+        self.assertEqual(result["selected_symbols"], ["NVDA", "MSFT"])
+        self.assertEqual([item["symbol"] for item in result["selected_candidates"]], ["NVDA", "MSFT"])
+        self.assertEqual(result["selection_reason"], "higher quality setup")
+
+    def test_worker_uses_agentic_selector_for_final_shortlist(self):
+        executor = type("Executor", (), {"get_positions": lambda self: [{"symbol": "AAPL", "qty": "5"}]})()
+
+        ranked_candidates = [
+            {"symbol": "MSFT", "score": 0.8},
+            {"symbol": "NVDA", "score": 0.75},
+            {"symbol": "AMZN", "score": 0.7},
+        ]
+
+        with patch.dict(
+            os.environ,
+            {
+                "UNIVERSE_MODE": "sp500",
+                "PORTFOLIO_INCLUDE_OPEN_POSITIONS": "true",
+                "AGENTIC_SELECTION_ENABLED": "true",
+                "SCREEN_TOP_N": "2",
+            },
+            clear=False,
+        ), patch.object(
+            worker,
+            "_discover_market_candidates",
+            return_value=ranked_candidates,
+        ), patch.object(
+            worker,
+            "_select_market_candidates",
+            return_value={
+                "selected_candidates": [ranked_candidates[1], ranked_candidates[0]],
+                "selection_reason": "favor diversification",
+                "agentic_selection_enabled": True,
+            },
+        ):
+            tickers, context = worker._resolve_analysis_tickers(executor, "2026-04-01")
+
+        self.assertEqual(tickers, ["AAPL", "NVDA", "MSFT"])
+        self.assertEqual([item["symbol"] for item in context["selected_candidates"]], ["NVDA", "MSFT"])
+        self.assertEqual(context["selection_reason"], "favor diversification")
+        self.assertTrue(context["agentic_selection_enabled"])
