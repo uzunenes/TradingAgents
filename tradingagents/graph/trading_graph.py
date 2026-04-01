@@ -242,7 +242,8 @@ class TradingAgentsGraph:
 
     def _log_state(self, trade_date, final_state):
         """Log the final state to a JSON file."""
-        self.log_states_dict[str(trade_date)] = {
+        log_suffix = self.config.get("log_file_suffix") or str(trade_date)
+        self.log_states_dict[str(log_suffix)] = {
             "company_of_interest": final_state["company_of_interest"],
             "trade_date": final_state["trade_date"],
             "llm_config": self._build_llm_trace(),
@@ -278,7 +279,7 @@ class TradingAgentsGraph:
         directory.mkdir(parents=True, exist_ok=True)
 
         with open(
-            f"eval_results/{self.ticker}/TradingAgentsStrategy_logs/full_states_log_{trade_date}.json",
+            f"eval_results/{self.ticker}/TradingAgentsStrategy_logs/full_states_log_{log_suffix}.json",
             "w",
             encoding="utf-8",
         ) as f:
