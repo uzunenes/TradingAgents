@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TradingAgents Pipeline</title>
+  <link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">TradingAgents</p>
+        <h1>Realtime Pipeline Monitor</h1>
+        <p class="subtle">Live stages, ticker progress, and model routing from the running worker.</p>
+      </div>
+      <div class="hero-meta">
+        <span id="connection-badge" class="badge badge-idle">idle</span>
+        <button id="trigger-button" type="button">Trigger Run</button>
+      </div>
+    </header>
+
+    <section class="panel summary-grid">
+      <article>
+        <h2>Run</h2>
+        <dl>
+          <div><dt>Status</dt><dd id="run-status">idle</dd></div>
+          <div><dt>Session</dt><dd id="run-session">-</dd></div>
+          <div><dt>Run ID</dt><dd id="run-id">-</dd></div>
+          <div><dt>Current</dt><dd id="run-current">-</dd></div>
+        </dl>
+      </article>
+      <article>
+        <h2>Models</h2>
+        <dl>
+          <div><dt>Quick</dt><dd id="model-quick">-</dd></div>
+          <div><dt>Selection</dt><dd id="model-selection">-</dd></div>
+          <div><dt>Fundamentals</dt><dd id="model-fundamentals">-</dd></div>
+          <div><dt>Deep</dt><dd id="model-deep">-</dd></div>
+        </dl>
+      </article>
+      <article>
+        <h2>Discovery</h2>
+        <dl>
+          <div><dt>Mode</dt><dd id="discovery-mode">-</dd></div>
+          <div><dt>Selected</dt><dd id="discovery-selected">-</dd></div>
+          <div><dt>Held</dt><dd id="discovery-held">-</dd></div>
+          <div><dt>Reason</dt><dd id="discovery-reason">-</dd></div>
+        </dl>
+      </article>
+    </section>
+
+    <section class="panel">
+      <div class="section-head">
+        <h2>Pipeline Flow</h2>
+        <p id="pipeline-totals" class="subtle">0 / 0 tickers completed</p>
+      </div>
+      <div id="stage-flow" class="stage-flow"></div>
+    </section>
+
+    <section class="grid-two">
+      <section class="panel">
+        <div class="section-head">
+          <h2>Tickers</h2>
+          <p class="subtle">Realtime status by symbol</p>
+        </div>
+        <div id="ticker-grid" class="ticker-grid"></div>
+      </section>
+
+      <section class="panel">
+        <div class="section-head">
+          <h2>Recent Events</h2>
+          <p class="subtle">Newest first</p>
+        </div>
+        <div id="event-list" class="event-list"></div>
+      </section>
+    </section>
+  </main>
+
+  <script src="/static/dashboard.js"></script>
+</body>
+</html>

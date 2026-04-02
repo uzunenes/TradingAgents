@@ -86,6 +86,70 @@ class TestIntradayWorkerHelpers(unittest.TestCase):
         self.assertEqual(status_code, 202)
         self.assertEqual(payload["status"], "accepted")
 
+    def test_pipeline_state_endpoint_reports_pipeline_snapshot(self):
+        worker._reset_pipeline_state(
+            run_id="run-1",
+            session_name="smoke",
+            trigger_source="http",
+            llm_settings={
+                "provider": "openrouter",
+                "quick_model": "quick",
+                "selection_model": "mini",
+                "fundamentals_model": "fund",
+                "deep_model": "deep",
+            },
+        )
+        worker._set_pipeline_stage("analysis", "running", "Analysing test ticker.")
+        worker._set_pipeline_tickers(["MSFT"])
+
+        server = worker._build_http_server("127.0.0.1", 0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            with urlopen(f"http://127.0.0.1:{port}/pipeline-state") as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["pipeline"]["run_id"], "run-1")
+        self.assertEqual(payload["pipeline"]["stages"]["analysis"]["status"], "running")
+        self.assertEqual(payload["pipeline"]["llm_settings"]["selection_model"], "mini")
+
+    def test_dashboard_route_serves_html(self):
+        server = worker._build_http_server("127.0.0.1", 0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            with urlopen(f"http://127.0.0.1:{port}/dashboard") as response:
+                body = response.read().decode("utf-8")
+                status_code = response.status
+                content_type = response.headers.get("Content-Type")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertEqual(status_code, 200)
+        self.assertIn("text/html", content_type)
+        self.assertIn("Realtime Pipeline Monitor", body)
+
+    def test_selection_model_defaults_to_quick_model_when_unset(self):
+        with patch.dict(
+            os.environ,
+            {
+                "LLM_PROVIDER": "openrouter",
+                "QUICK_MODEL": "anthropic/claude-sonnet-4.6",
+                "AGENTIC_SELECTION_MODEL": "",
+            },
+            clear=False,
+        ):
+            settings = worker._resolve_llm_settings()
+
+        self.assertEqual(settings["selection_model"], settings["quick_model"])
+
     def test_health_payload_is_flat_and_stable(self):
         with patch.object(
             worker,

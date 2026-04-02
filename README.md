@@ -138,6 +138,14 @@ Alternatively, copy `.env.example` to `.env` and fill in your keys:
 cp .env.example .env
 ```
 
+For OpenRouter-backed autonomous scans, you can also override the lightweight shortlist selector independently:
+```bash
+export QUICK_MODEL=anthropic/claude-sonnet-4.6
+export FUNDAMENTALS_MODEL=google/gemini-3.1-pro-preview
+export DEEP_MODEL=openai/gpt-5.4
+export AGENTIC_SELECTION_MODEL=openai/gpt-5.4-mini
+```
+
 ### CLI Usage
 
 Launch the interactive CLI:
@@ -160,6 +168,20 @@ An interface will appear showing results as they load, letting you track the age
 <p align="center">
   <img src="assets/cli/cli_transaction.png" width="100%" style="display: inline-block; margin: 0 2%;">
 </p>
+
+### Realtime Worker Dashboard
+
+The autonomous worker exposes a small HTTP surface for operations and monitoring:
+
+```text
+GET  /healthz           basic health payload
+GET  /pipeline-state    current in-memory pipeline snapshot
+GET  /events/pipeline   server-sent event stream for live updates
+GET  /dashboard         realtime monitoring UI
+POST /trigger           trigger a new run
+```
+
+When the worker is running locally or on Railway, open `/dashboard` to watch the pipeline stages, selected symbols, per-ticker progress, and recent events update live in the browser.
 
 ## TradingAgents Package
 

@@ -24,6 +24,7 @@ Configuration via environment variables:
     SCREEN_BATCH_SIZE           batch size for yfinance downloads (default: 100)
     MIN_AVG_DOLLAR_VOLUME_USD   liquidity floor for screener (default: 50000000)
     AGENTIC_SELECTION_ENABLED   true/false use quick-model selector on ranked candidate pool (default: true)
+    AGENTIC_SELECTION_MODEL     optional smaller model override for agentic shortlist selection
     PORTFOLIO_INCLUDE_OPEN_POSITIONS  true/false include current positions in analysis set
     MAX_NEW_BUYS_PER_RUN        cap new entries per session (default: 3)
   TRADING_ENABLED             true/false (default: true)
@@ -40,9 +41,13 @@ Configuration via environment variables:
 
 from __future__ import annotations
 
+import copy
+from collections import deque
 import json
 import logging
+import mimetypes
 import os
+from pathlib import Path
 import sys
 import threading
 import time
@@ -131,6 +136,57 @@ _RUN_STATE = {
     "current": None,
     "last": None,
 }
+_PIPELINE_STATE_LOCK = threading.Lock()
+_PIPELINE_EVENT_CONDITION = threading.Condition()
+_PIPELINE_EVENT_SEQ = 0
+
+_STATIC_DIR = Path(__file__).resolve().parent / "cli" / "static"
+_PIPELINE_STAGE_META = {
+    "universe": "Universe Build",
+    "selection": "Agentic Selection",
+    "analysis": "Analysis",
+    "execution": "Portfolio Decision",
+    "summary": "Order Execution / Summary",
+}
+
+
+def _fresh_stage_states() -> dict[str, dict]:
+    return {
+        key: {
+            "key": key,
+            "label": label,
+            "status": "pending",
+            "message": "",
+            "started_at": None,
+            "finished_at": None,
+        }
+        for key, label in _PIPELINE_STAGE_META.items()
+    }
+
+
+def _fresh_pipeline_state() -> dict:
+    return {
+        "status": "idle",
+        "run_id": None,
+        "session_name": None,
+        "trigger_source": None,
+        "started_at": None,
+        "updated_at": None,
+        "finished_at": None,
+        "current_stage": None,
+        "current_ticker": None,
+        "tickers_total": 0,
+        "tickers_completed": 0,
+        "tickers": [],
+        "stages": _fresh_stage_states(),
+        "recent_events": [],
+        "llm_settings": {},
+        "discovery_context": {},
+        "last_error": None,
+    }
+
+
+_PIPELINE_STATE = _fresh_pipeline_state()
 
 
 @dataclass(frozen=True)
@@ -138,6 +194,221 @@ class SessionSchedule:
     name: str
     hour: int
     minute: int
+
+
+def _pipeline_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _publish_pipeline_event(event_type: str, message: str, **extra) -> None:
+    global _PIPELINE_EVENT_SEQ
+
+    event = {
+        "timestamp": _pipeline_now(),
+        "type": event_type,
+        "message": message,
+    }
+    event.update(extra)
+
+    with _PIPELINE_STATE_LOCK:
+        _PIPELINE_STATE["updated_at"] = event["timestamp"]
+        recent_events = deque(_PIPELINE_STATE.get("recent_events", []), maxlen=100)
+        recent_events.append(event)
+        _PIPELINE_STATE["recent_events"] = list(recent_events)
+
+    with _PIPELINE_EVENT_CONDITION:
+        _PIPELINE_EVENT_SEQ += 1
+        _PIPELINE_EVENT_CONDITION.notify_all()
+
+
+def _snapshot_pipeline_state() -> dict:
+    with _PIPELINE_STATE_LOCK:
+        return copy.deepcopy(_PIPELINE_STATE)
+
+
+def _reset_pipeline_state(
+    run_id: str,
+    session_name: str,
+    trigger_source: str,
+    llm_settings: dict,
+) -> None:
+    global _PIPELINE_STATE
+
+    with _PIPELINE_STATE_LOCK:
+        _PIPELINE_STATE = _fresh_pipeline_state()
+        _PIPELINE_STATE.update(
+            {
+                "status": "running",
+                "run_id": run_id,
+                "session_name": session_name,
+                "trigger_source": trigger_source,
+                "started_at": _pipeline_now(),
+                "updated_at": _pipeline_now(),
+                "llm_settings": {
+                    "provider": llm_settings.get("provider"),
+                    "quick_model": llm_settings.get("quick_model"),
+                    "selection_model": llm_settings.get("selection_model"),
+                    "fundamentals_model": llm_settings.get("fundamentals_model"),
+                    "deep_model": llm_settings.get("deep_model"),
+                },
+            }
+        )
+
+    _publish_pipeline_event(
+        "run_started",
+        f"Run started for session {session_name}.",
+        run_id=run_id,
+        session_name=session_name,
+        trigger_source=trigger_source,
+    )
+
+
+def _set_pipeline_stage(stage: str, status: str, message: str = "") -> None:
+    timestamp = _pipeline_now()
+    with _PIPELINE_STATE_LOCK:
+        stage_state = _PIPELINE_STATE["stages"].get(stage)
+        if not stage_state:
+            return
+        stage_state["status"] = status
+        stage_state["message"] = message
+        if status == "running" and stage_state["started_at"] is None:
+            stage_state["started_at"] = timestamp
+        if status in {"completed", "failed", "skipped"}:
+            stage_state["finished_at"] = timestamp
+        _PIPELINE_STATE["current_stage"] = stage if status == "running" else _PIPELINE_STATE.get("current_stage")
+        if status in {"completed", "failed"} and _PIPELINE_STATE.get("current_stage") == stage:
+            _PIPELINE_STATE["current_stage"] = None
+
+    _publish_pipeline_event(
+        "stage_updated",
+        message or f"Stage {stage} -> {status}",
+        stage=stage,
+        stage_status=status,
+    )
+
+
+def _set_pipeline_tickers(tickers: list[str]) -> None:
+    with _PIPELINE_STATE_LOCK:
+        _PIPELINE_STATE["tickers_total"] = len(tickers)
+        _PIPELINE_STATE["tickers_completed"] = 0
+        _PIPELINE_STATE["tickers"] = [
+            {
+                "symbol": ticker,
+                "status": "pending",
+                "phase": "pending",
+                "signal": None,
+                "action": None,
+                "reason": None,
+                "error": None,
+                "started_at": None,
+                "finished_at": None,
+                "log_path": None,
+            }
+            for ticker in tickers
+        ]
+
+    _publish_pipeline_event("tickers_resolved", f"Resolved {len(tickers)} ticker(s).", tickers=tickers)
+
+
+def _set_pipeline_discovery_context(discovery_context: dict) -> None:
+    summary = {
+        "universe_mode": discovery_context.get("universe_mode"),
+        "held_symbols": discovery_context.get("held_symbols", []),
+        "selected_symbols": [
+            item.get("symbol")
+            for item in discovery_context.get("selected_candidates", [])
+        ],
+        "ranked_symbols": [
+            item.get("symbol")
+            for item in discovery_context.get("ranked_candidates", [])[:20]
+        ],
+        "selection_reason": discovery_context.get("selection_reason", ""),
+        "used_explicit_fallback": discovery_context.get("used_explicit_fallback", False),
+    }
+    with _PIPELINE_STATE_LOCK:
+        _PIPELINE_STATE["discovery_context"] = summary
+
+    _publish_pipeline_event(
+        "discovery_updated",
+        "Discovery context updated.",
+        discovery_context=summary,
+    )
+
+
+def _update_pipeline_ticker(
+    symbol: str,
+    *,
+    status: Optional[str] = None,
+    phase: Optional[str] = None,
+    signal: Optional[str] = None,
+    action: Optional[str] = None,
+    reason: Optional[str] = None,
+    error: Optional[str] = None,
+    log_path: Optional[str] = None,
+) -> None:
+    timestamp = _pipeline_now()
+    event_status = status
+    with _PIPELINE_STATE_LOCK:
+        for ticker_state in _PIPELINE_STATE["tickers"]:
+            if ticker_state["symbol"] != symbol:
+                continue
+            if status:
+                ticker_state["status"] = status
+                if status == "running" and ticker_state["started_at"] is None:
+                    ticker_state["started_at"] = timestamp
+                if status in {"completed", "failed", "skipped"}:
+                    ticker_state["finished_at"] = timestamp
+            if phase:
+                ticker_state["phase"] = phase
+            if signal is not None:
+                ticker_state["signal"] = signal
+            if action is not None:
+                ticker_state["action"] = action
+            if reason is not None:
+                ticker_state["reason"] = reason
+            if error is not None:
+                ticker_state["error"] = error
+            if log_path is not None:
+                ticker_state["log_path"] = log_path
+            _PIPELINE_STATE["current_ticker"] = symbol if ticker_state["status"] == "running" else _PIPELINE_STATE.get("current_ticker")
+            if ticker_state["status"] in {"completed", "failed", "skipped"}:
+                _PIPELINE_STATE["tickers_completed"] = sum(
+                    1
+                    for item in _PIPELINE_STATE["tickers"]
+                    if item["status"] in {"completed", "failed", "skipped"}
+                )
+                if _PIPELINE_STATE.get("current_ticker") == symbol:
+                    _PIPELINE_STATE["current_ticker"] = None
+            break
+
+    if event_status:
+        _publish_pipeline_event(
+            "ticker_updated",
+            f"{symbol} -> {event_status}",
+            symbol=symbol,
+            status=event_status,
+            phase=phase,
+            signal=signal,
+            action=action,
+        )
+
+
+def _mark_pipeline_finished(status: str, reason: Optional[str]) -> None:
+    timestamp = _pipeline_now()
+    with _PIPELINE_STATE_LOCK:
+        _PIPELINE_STATE["status"] = status
+        _PIPELINE_STATE["finished_at"] = timestamp
+        _PIPELINE_STATE["updated_at"] = timestamp
+        _PIPELINE_STATE["current_stage"] = None
+        _PIPELINE_STATE["current_ticker"] = None
+        _PIPELINE_STATE["last_error"] = reason
+
+    _publish_pipeline_event(
+        "run_finished",
+        reason or f"Run {status}.",
+        status=status,
+        reason=reason,
+    )
 
 
 class TelegramNotifier:
@@ -296,6 +567,7 @@ def _build_telegram_summary(
         f"LLM_PROVIDER: {llm_settings['provider']}",
         f"BACKEND_URL: {llm_settings['backend_url']}",
         f"QUICK_MODEL: {llm_settings['quick_model']}",
+        f"SELECTION_MODEL: {llm_settings.get('selection_model', llm_settings['quick_model'])}",
         f"FUNDAMENTALS_MODEL: {llm_settings['fundamentals_model']}",
         f"DEEP_MODEL: {llm_settings['deep_model']}",
         "",
@@ -495,11 +767,15 @@ def _select_market_candidates(
         from tradingagents.screeners.selector_agent import select_candidates_with_llm
 
         llm_settings = _resolve_llm_settings()
+        selector_settings = dict(llm_settings)
+        selector_settings["quick_model"] = llm_settings.get(
+            "selection_model", llm_settings["quick_model"]
+        )
         selection = select_candidates_with_llm(
             ranked_candidates=ranked_candidates,
             held_symbols=held_symbols,
             trade_date=trade_date,
-            llm_settings=llm_settings,
+            llm_settings=selector_settings,
             selection_count=min(target_count, len(ranked_candidates)),
         )
         selection["agentic_selection_enabled"] = True
@@ -528,6 +804,8 @@ def _resolve_analysis_tickers(executor, trade_date: str) -> tuple[list[str], dic
     explicit_tickers = _get_explicit_tickers()
 
     if universe_mode != "sp500":
+        _set_pipeline_stage("universe", "completed", "Using fixed ticker universe.")
+        _set_pipeline_stage("selection", "skipped", "Agentic selection skipped for fixed mode.")
         return explicit_tickers, {
             "universe_mode": "fixed",
             "ranked_candidates": [],
@@ -537,11 +815,23 @@ def _resolve_analysis_tickers(executor, trade_date: str) -> tuple[list[str], dic
 
     held_symbols = _get_open_position_tickers(executor)
     try:
+        _set_pipeline_stage("universe", "running", "Ranking S&P 500 candidate pool.")
         ranked_candidates = _discover_market_candidates(trade_date)
+        _set_pipeline_stage(
+            "universe",
+            "completed",
+            f"Ranked {len(ranked_candidates)} candidates from S&P 500 universe.",
+        )
+        _set_pipeline_stage("selection", "running", "Running agentic shortlist selection.")
         selection = _select_market_candidates(ranked_candidates, held_symbols, trade_date)
         selected_candidates = selection.get("selected_candidates", ranked_candidates)
         candidate_symbols = [item["symbol"] for item in selected_candidates]
         tickers = _merge_ticker_lists(held_symbols, candidate_symbols)
+        _set_pipeline_stage(
+            "selection",
+            "completed",
+            f"Selected {len(candidate_symbols)} shortlisted ticker(s).",
+        )
         return tickers, {
             "universe_mode": "sp500",
             "ranked_candidates": ranked_candidates,
@@ -553,6 +843,8 @@ def _resolve_analysis_tickers(executor, trade_date: str) -> tuple[list[str], dic
         }
     except Exception as exc:
         logger.warning("Screener failed, falling back to explicit tickers: %s", exc)
+        _set_pipeline_stage("universe", "failed", f"Universe ranking failed: {exc}")
+        _set_pipeline_stage("selection", "skipped", "Using explicit fallback tickers.")
         tickers = _merge_ticker_lists(held_symbols, explicit_tickers)
         return tickers, {
             "universe_mode": "sp500",
@@ -597,10 +889,12 @@ def _resolve_llm_settings() -> dict:
         default_deep_model = "openai/gpt-5.4"
         default_fundamentals_model = "google/gemini-3.1-pro-preview"
 
+    quick_model = _get_env_str("QUICK_MODEL", default_quick_model)
     return {
         "provider": provider,
         "backend_url": backend_url,
-        "quick_model": _get_env_str("QUICK_MODEL", default_quick_model),
+        "quick_model": quick_model,
+        "selection_model": _get_env_str("AGENTIC_SELECTION_MODEL", quick_model),
         "fundamentals_model": _get_env_str(
             "FUNDAMENTALS_MODEL", default_fundamentals_model
         ),
@@ -681,6 +975,7 @@ def _mark_run_finished(status: str, reason: Optional[str]) -> None:
         }
         _RUN_STATE["active"] = False
         _RUN_STATE["current"] = None
+    _mark_pipeline_finished(status, reason)
 
 
 def _is_http_trigger_enabled() -> bool:
@@ -723,9 +1018,40 @@ def _build_health_payload() -> dict:
     }
 
 
+def _build_pipeline_payload() -> dict:
+    return {
+        "status": "ok",
+        "pipeline": _snapshot_pipeline_state(),
+    }
+
+
+def _resolve_static_path(request_path: str) -> Optional[Path]:
+    normalized = request_path.strip() or "/dashboard"
+    if normalized in {"/dashboard", "/dashboard/"}:
+        candidate = _STATIC_DIR / "dashboard.html"
+    elif normalized.startswith("/static/"):
+        relative = normalized.removeprefix("/static/")
+        candidate = _STATIC_DIR / relative
+    else:
+        return None
+
+    try:
+        resolved = candidate.resolve(strict=True)
+    except FileNotFoundError:
+        return None
+
+    static_root = _STATIC_DIR.resolve()
+    if static_root not in resolved.parents and resolved != static_root:
+        return None
+    return resolved
+
+
 def _run_reserved_job(session_name: str, trigger_source: str) -> dict:
     try:
-        result = _execute_trading_job(session_name=session_name)
+        result = _execute_trading_job(
+            session_name=session_name,
+            trigger_source=trigger_source,
+        )
         _mark_run_finished(result["status"], result.get("reason"))
         return result
     except Exception as exc:
@@ -768,13 +1094,25 @@ def _start_background_job(session_name: str, trigger_source: str = "http") -> tu
 
 
 class WorkerHttpHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path in {"/", "/healthz", "/readyz"}:
             self._write_json(200, _build_health_payload())
             return
+        if parsed.path == "/pipeline-state":
+            self._write_json(200, _build_pipeline_payload())
+            return
+        if parsed.path == "/events/pipeline":
+            self._handle_pipeline_events()
+            return
         if parsed.path == "/trigger":
             self._handle_trigger(parsed)
+            return
+        static_path = _resolve_static_path(parsed.path)
+        if static_path:
+            self._write_static_file(static_path)
             return
         self._write_json(404, {"status": "not_found"})
 
@@ -796,6 +1134,56 @@ class WorkerHttpHandler(BaseHTTPRequestHandler):
             trigger_source="http",
         )
         self._write_json(202 if accepted else 409, payload)
+
+    def _handle_pipeline_events(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+
+        try:
+            payload = _build_pipeline_payload()
+            self.wfile.write(
+                (
+                    "event: pipeline\n"
+                    f"data: {json.dumps(payload)}\n\n"
+                ).encode("utf-8")
+            )
+            self.wfile.flush()
+            last_seq = _PIPELINE_EVENT_SEQ
+
+            while True:
+                with _PIPELINE_EVENT_CONDITION:
+                    if _PIPELINE_EVENT_SEQ == last_seq:
+                        _PIPELINE_EVENT_CONDITION.wait(timeout=10)
+                    current_seq = _PIPELINE_EVENT_SEQ
+
+                if current_seq == last_seq:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    continue
+
+                payload = _build_pipeline_payload()
+                self.wfile.write(
+                    (
+                        "event: pipeline\n"
+                        f"data: {json.dumps(payload)}\n\n"
+                    ).encode("utf-8")
+                )
+                self.wfile.flush()
+                last_seq = current_seq
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+    def _write_static_file(self, path: Path) -> None:
+        body = path.read_bytes()
+        content_type, _ = mimetypes.guess_type(str(path))
+        self.send_response(200)
+        self.send_header("Content-Type", content_type or "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _write_json(self, status_code: int, payload: dict) -> None:
         body = json.dumps(payload).encode("utf-8")
@@ -839,7 +1227,10 @@ def _wait_forever() -> None:
 # Main job
 # ---------------------------------------------------------------------------
 
-def _execute_trading_job(session_name: str = "manual") -> dict:
+def _execute_trading_job(
+    session_name: str = "manual",
+    trigger_source: str = "manual",
+) -> dict:
     """Analyse each ticker and route signal to Alpaca executor."""
     from alpaca_trade import AlpacaExecutor
 
@@ -847,14 +1238,20 @@ def _execute_trading_job(session_name: str = "manual") -> dict:
     today = started_at.date().isoformat()
     run_id = _build_run_id(today, session_name, started_at)
     llm_settings = _resolve_llm_settings()
+    _reset_pipeline_state(run_id, session_name, trigger_source, llm_settings)
 
     executor = AlpacaExecutor()
     notifier = TelegramNotifier()
     executor.reset_session_guard()
     tickers, discovery_context = _resolve_analysis_tickers(executor, today)
+    _set_pipeline_discovery_context(discovery_context)
     if not tickers:
         logger.warning("No tickers resolved for this run; aborting.")
+        _set_pipeline_stage("analysis", "failed", "No tickers resolved for this run.")
         return {"status": "skipped", "reason": "no_tickers"}
+
+    _set_pipeline_tickers(tickers)
+    _set_pipeline_stage("analysis", "running", f"Analysing {len(tickers)} ticker(s).")
 
     logger.info(
         "=== Trading job started: date=%s session=%s run_id=%s tickers=%s ===",
@@ -881,6 +1278,7 @@ def _execute_trading_job(session_name: str = "manual") -> dict:
         )
     except Exception as exc:
         logger.error("Alpaca connection failed: %s — aborting job.", exc)
+        _set_pipeline_stage("execution", "failed", f"Alpaca connection failed: {exc}")
         return {"status": "failed", "reason": f"alpaca_connection_failed: {exc}"}
 
     logger.info(
@@ -892,9 +1290,14 @@ def _execute_trading_job(session_name: str = "manual") -> dict:
     run_results: list[dict] = []
     max_new_buys = _get_env_int("MAX_NEW_BUYS_PER_RUN", 3)
     new_buys_placed = 0
+    execution_stage_started = False
 
     for ticker in tickers:
         logger.info("Analysing %s ...", ticker)
+        _update_pipeline_ticker(ticker, status="running", phase="analysis", log_path=(
+            f"eval_results/{ticker}/TradingAgentsStrategy_logs/"
+            f"full_states_log_{run_id}.json"
+        ))
         retries = 3
         signal = "HOLD"
         analysis_error = ""
@@ -935,7 +1338,20 @@ def _execute_trading_job(session_name: str = "manual") -> dict:
                     "log_path": log_path,
                 }
             )
+            _update_pipeline_ticker(
+                ticker,
+                status="skipped",
+                phase="execution",
+                signal=signal,
+                action="SKIPPED",
+                reason="buy_budget_reached",
+                log_path=log_path,
+            )
             continue
+
+        if not execution_stage_started:
+            _set_pipeline_stage("execution", "running", "Evaluating portfolio actions.")
+            execution_stage_started = True
 
         execution = executor.execute_with_details(ticker, signal)
         order = execution.get("order")
@@ -951,6 +1367,15 @@ def _execute_trading_job(session_name: str = "manual") -> dict:
                     "reason": execution.get("reason"),
                     "log_path": log_path,
                 }
+            )
+            _update_pipeline_ticker(
+                ticker,
+                status="completed",
+                phase="execution",
+                signal=signal,
+                action=f"ORDER_{order.get('side', '').upper()}",
+                reason=execution.get("reason"),
+                log_path=log_path,
             )
         else:
             reason = execution.get("reason")
@@ -971,9 +1396,26 @@ def _execute_trading_job(session_name: str = "manual") -> dict:
                     "log_path": log_path,
                 }
             )
+            _update_pipeline_ticker(
+                ticker,
+                status="completed",
+                phase="execution",
+                signal=signal,
+                action=execution.get("status", "HOLD_OR_SKIPPED").upper(),
+                reason=reason,
+                error=analysis_error or None,
+                log_path=log_path,
+            )
+
+    _set_pipeline_stage("analysis", "completed", f"Completed analysis for {len(tickers)} ticker(s).")
+    if execution_stage_started:
+        _set_pipeline_stage("execution", "completed", "Portfolio decisions completed.")
+    else:
+        _set_pipeline_stage("execution", "skipped", "No executable portfolio actions were evaluated.")
 
     # Send compact run summary to Telegram after each scan.
     try:
+        _set_pipeline_stage("summary", "running", "Building and sending Telegram summary.")
         logger.info("Preparing Telegram summary...")
         account_end = executor.get_account()
         logger.debug("Got account info: %s", account_end)
@@ -1000,12 +1442,14 @@ def _execute_trading_job(session_name: str = "manual") -> dict:
         logger.info("Calling TelegramNotifier.send()...")
         notifier.send(summary)
         logger.info("Telegram notification flow completed.")
+        _set_pipeline_stage("summary", "completed", "Summary delivery completed.")
     except Exception as exc:
         logger.error(
             "Telegram summary step failed: %s",
             exc,
             exc_info=True,
         )
+        _set_pipeline_stage("summary", "failed", f"Summary delivery failed: {exc}")
 
     logger.info("=== Trading job finished: run_id=%s ===", run_id)
     return {"status": "completed", "reason": None}
