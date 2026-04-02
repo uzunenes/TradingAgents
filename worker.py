@@ -1177,11 +1177,11 @@ def _resolve_llm_settings() -> dict:
     default_fundamentals_model = default_deep_model
 
     if provider == "openrouter":
-        default_quick_model = "google/gemini-3.1-flash"
+        default_quick_model = "google/gemini-3.1-flash-lite-preview"
         default_deep_model = "openai/gpt-5.4"
-        default_selection_model = "google/gemini-3.1-flash"
-        default_analyst_model = "google/gemini-3.1-flash"
-        default_fundamentals_model = "google/gemini-3.1-flash"
+        default_selection_model = "google/gemini-3.1-flash-lite-preview"
+        default_analyst_model = "google/gemini-3.1-flash-lite-preview"
+        default_fundamentals_model = "google/gemini-3.1-pro-preview"
         default_research_model = "openai/gpt-5.4-mini"
         default_trader_model = "openai/gpt-5.4-mini"
         default_risk_model = "openai/gpt-5.4-mini"

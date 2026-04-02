@@ -169,7 +169,7 @@ class TestIntradayWorkerHelpers(unittest.TestCase):
             os.environ,
             {
                 "LLM_PROVIDER": "openrouter",
-                "QUICK_MODEL": "google/gemini-3.1-flash",
+                "QUICK_MODEL": "google/gemini-3.1-flash-lite-preview",
                 "AGENTIC_SELECTION_MODEL": "",
             },
             clear=False,
@@ -197,9 +197,9 @@ class TestIntradayWorkerHelpers(unittest.TestCase):
         ):
             settings = worker._resolve_llm_settings()
 
-        self.assertEqual(settings["quick_model"], "google/gemini-3.1-flash")
-        self.assertEqual(settings["analyst_model"], "google/gemini-3.1-flash")
-        self.assertEqual(settings["fundamentals_model"], "google/gemini-3.1-flash")
+        self.assertEqual(settings["quick_model"], "google/gemini-3.1-flash-lite-preview")
+        self.assertEqual(settings["analyst_model"], "google/gemini-3.1-flash-lite-preview")
+        self.assertEqual(settings["fundamentals_model"], "google/gemini-3.1-pro-preview")
         self.assertEqual(settings["research_model"], "openai/gpt-5.4-mini")
         self.assertEqual(settings["manager_model"], "openai/gpt-5.4-mini")
         self.assertEqual(settings["deep_model"], "openai/gpt-5.4")
@@ -263,8 +263,8 @@ class TestIntradayWorkerHelpers(unittest.TestCase):
             },
             "llm_settings": {
                 "selection_model": "openai/gpt-5.4-mini",
-                "analyst_model": "google/gemini-3.1-flash",
-                "fundamentals_model": "google/gemini-3.1-flash",
+                "analyst_model": "google/gemini-3.1-flash-lite-preview",
+                "fundamentals_model": "google/gemini-3.1-pro-preview",
                 "research_model": "openai/gpt-5.4-mini",
                 "trader_model": "openai/gpt-5.4-mini",
                 "risk_model": "openai/gpt-5.4-mini",

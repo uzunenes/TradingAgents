@@ -140,9 +140,9 @@ cp .env.example .env
 
 For OpenRouter-backed autonomous scans, you can also override the lightweight shortlist selector independently:
 ```bash
-export QUICK_MODEL=google/gemini-3.1-flash
-export ANALYST_MODEL=google/gemini-3.1-flash
-export FUNDAMENTALS_MODEL=google/gemini-3.1-flash
+export QUICK_MODEL=google/gemini-3.1-flash-lite-preview
+export ANALYST_MODEL=google/gemini-3.1-flash-lite-preview
+export FUNDAMENTALS_MODEL=google/gemini-3.1-pro-preview
 export RESEARCH_MODEL=openai/gpt-5.4-mini
 export TRADER_MODEL=openai/gpt-5.4-mini
 export RISK_MODEL=openai/gpt-5.4-mini
