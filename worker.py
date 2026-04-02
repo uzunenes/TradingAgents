@@ -131,10 +131,16 @@ logger = logging.getLogger("worker")
 
 _RUN_LOCK = threading.Lock()
 _RUN_STATE_LOCK = threading.Lock()
+_STOP_REQUEST_LOCK = threading.Lock()
 _RUN_STATE = {
     "active": False,
     "current": None,
     "last": None,
+}
+_STOP_REQUEST = {
+    "requested": False,
+    "requested_at": None,
+    "reason": None,
 }
 _PIPELINE_STATE_LOCK = threading.Lock()
 _PIPELINE_EVENT_CONDITION = threading.Condition()
@@ -147,6 +153,34 @@ _PIPELINE_STAGE_META = {
     "analysis": "Analysis",
     "execution": "Portfolio Decision",
     "summary": "Order Execution / Summary",
+}
+
+_MODEL_PRICING_PER_1M_TOKENS_USD = {
+    "openai/gpt-5.4": {"input": 30.0, "output": 180.0},
+    "openai/gpt-5.4-mini": {"input": 3.0, "output": 15.0},
+    "openai/gpt-5.4-nano": {"input": 0.6, "output": 2.4},
+    "google/gemini-3.1-flash": {"input": 0.35, "output": 1.05},
+    "google/gemini-3.1-flash-lite-preview": {"input": 0.1, "output": 0.4},
+    "google/gemini-3.1-pro-preview": {"input": 3.5, "output": 10.5},
+    "anthropic/claude-sonnet-4.6": {"input": 3.0, "output": 15.0},
+    "anthropic/claude-sonnet-4-6": {"input": 3.0, "output": 15.0},
+    "claude-sonnet-4-6": {"input": 3.0, "output": 15.0},
+}
+
+_RUN_COST_ROLE_ASSUMPTIONS = {
+    "selection": {"model_key": "selection_model", "calls": 1, "input_tokens": 2800, "output_tokens": 450},
+    "market": {"model_key": "analyst_model", "calls": 1, "input_tokens": 2800, "output_tokens": 650},
+    "social": {"model_key": "analyst_model", "calls": 1, "input_tokens": 2600, "output_tokens": 650},
+    "news": {"model_key": "analyst_model", "calls": 1, "input_tokens": 2600, "output_tokens": 650},
+    "fundamentals": {"model_key": "fundamentals_model", "calls": 1, "input_tokens": 3200, "output_tokens": 800},
+    "bull_researcher": {"model_key": "research_model", "calls": 1, "input_tokens": 2600, "output_tokens": 650},
+    "bear_researcher": {"model_key": "research_model", "calls": 1, "input_tokens": 2600, "output_tokens": 650},
+    "research_manager": {"model_key": "manager_model", "calls": 1, "input_tokens": 2200, "output_tokens": 450},
+    "trader": {"model_key": "trader_model", "calls": 1, "input_tokens": 1800, "output_tokens": 350},
+    "aggressive_analyst": {"model_key": "risk_model", "calls": 1, "input_tokens": 1900, "output_tokens": 350},
+    "neutral_analyst": {"model_key": "risk_model", "calls": 1, "input_tokens": 1900, "output_tokens": 350},
+    "conservative_analyst": {"model_key": "risk_model", "calls": 1, "input_tokens": 1900, "output_tokens": 350},
+    "portfolio_manager": {"model_key": "manager_model", "calls": 1, "input_tokens": 1800, "output_tokens": 250},
 }
 
 
@@ -182,6 +216,8 @@ def _fresh_pipeline_state() -> dict:
         "recent_events": [],
         "llm_settings": {},
         "discovery_context": {},
+        "stop_requested": False,
+        "stop_requested_at": None,
         "last_error": None,
     }
 
@@ -196,8 +232,152 @@ class SessionSchedule:
     minute: int
 
 
+class StopRequestedError(RuntimeError):
+    pass
+
+
 def _pipeline_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_iso8601(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _duration_seconds(started_at: Optional[str], finished_at: Optional[str] = None) -> Optional[float]:
+    started = _parse_iso8601(started_at)
+    if started is None:
+        return None
+
+    finished = _parse_iso8601(finished_at) or datetime.now(timezone.utc)
+    duration = (finished - started).total_seconds()
+    return max(duration, 0.0)
+
+
+def _normalize_model_name(model_name: Optional[str]) -> Optional[str]:
+    if not model_name:
+        return None
+    return model_name.strip().lower()
+
+
+def _estimate_model_cost_usd(model_name: Optional[str], input_tokens: int, output_tokens: int) -> float:
+    normalized = _normalize_model_name(model_name)
+    if not normalized:
+        return 0.0
+    if normalized.endswith(":free"):
+        return 0.0
+
+    pricing = _MODEL_PRICING_PER_1M_TOKENS_USD.get(normalized)
+    if pricing is None and "/" not in normalized:
+        pricing = _MODEL_PRICING_PER_1M_TOKENS_USD.get(f"openai/{normalized}")
+    if pricing is None and "/" not in normalized:
+        pricing = _MODEL_PRICING_PER_1M_TOKENS_USD.get(f"google/{normalized}")
+    if pricing is None and "/" not in normalized:
+        pricing = _MODEL_PRICING_PER_1M_TOKENS_USD.get(f"anthropic/{normalized}")
+    if pricing is None:
+        return 0.0
+
+    return (
+        (input_tokens / 1_000_000.0) * pricing["input"]
+        + (output_tokens / 1_000_000.0) * pricing["output"]
+    )
+
+
+def _estimate_selection_cost_usd(pipeline_state: dict) -> float:
+    discovery = pipeline_state.get("discovery_context") or {}
+    ranked_count = len(discovery.get("ranked_symbols") or [])
+    if ranked_count == 0 or not discovery.get("universe_mode") == "sp500":
+        return 0.0
+
+    assumption = _RUN_COST_ROLE_ASSUMPTIONS["selection"]
+    llm_settings = pipeline_state.get("llm_settings") or {}
+    model_name = llm_settings.get(assumption["model_key"])
+    return _estimate_model_cost_usd(
+        model_name,
+        input_tokens=assumption["input_tokens"],
+        output_tokens=assumption["output_tokens"],
+    )
+
+
+def _estimate_per_ticker_cost_usd(llm_settings: dict) -> tuple[float, list[dict]]:
+    breakdown = []
+    total = 0.0
+    for role, assumption in _RUN_COST_ROLE_ASSUMPTIONS.items():
+        if role == "selection":
+            continue
+        model_name = llm_settings.get(assumption["model_key"])
+        role_cost = assumption["calls"] * _estimate_model_cost_usd(
+            model_name,
+            input_tokens=assumption["input_tokens"],
+            output_tokens=assumption["output_tokens"],
+        )
+        breakdown.append(
+            {
+                "role": role,
+                "model": model_name,
+                "estimated_cost_usd": round(role_cost, 6),
+            }
+        )
+        total += role_cost
+    return total, breakdown
+
+
+def _build_pipeline_telemetry(pipeline_state: dict) -> dict:
+    llm_settings = pipeline_state.get("llm_settings") or {}
+    tickers = pipeline_state.get("tickers") or []
+    completed_tickers = [
+        ticker for ticker in tickers if ticker.get("status") in {"completed", "failed", "skipped", "stopped"}
+    ]
+    pending_tickers = [
+        ticker for ticker in tickers if ticker.get("status") in {"pending", "running"}
+    ]
+
+    selection_cost = _estimate_selection_cost_usd(pipeline_state)
+    per_ticker_cost, role_breakdown = _estimate_per_ticker_cost_usd(llm_settings)
+    completed_cost = selection_cost + (len(completed_tickers) * per_ticker_cost)
+    total_estimated_cost = selection_cost + (len(tickers) * per_ticker_cost)
+    remaining_cost = len(pending_tickers) * per_ticker_cost
+
+    stage_durations = {}
+    for stage_key, stage_state in (pipeline_state.get("stages") or {}).items():
+        stage_durations[stage_key] = {
+            "status": stage_state.get("status"),
+            "duration_seconds": _duration_seconds(
+                stage_state.get("started_at"),
+                stage_state.get("finished_at"),
+            ),
+        }
+
+    ticker_durations = {}
+    for ticker in tickers:
+        ticker_durations[ticker["symbol"]] = {
+            "duration_seconds": _duration_seconds(
+                ticker.get("started_at"),
+                ticker.get("finished_at"),
+            ),
+            "estimated_cost_usd": round(per_ticker_cost, 6),
+        }
+
+    return {
+        "run_duration_seconds": _duration_seconds(
+            pipeline_state.get("started_at"),
+            pipeline_state.get("finished_at"),
+        ),
+        "selection_estimated_cost_usd": round(selection_cost, 6),
+        "per_ticker_estimated_cost_usd": round(per_ticker_cost, 6),
+        "completed_estimated_cost_usd": round(completed_cost, 6),
+        "remaining_estimated_cost_usd": round(remaining_cost, 6),
+        "total_estimated_cost_usd": round(total_estimated_cost, 6),
+        "stage_durations": stage_durations,
+        "ticker_durations": ticker_durations,
+        "role_cost_breakdown": role_breakdown,
+        "cost_basis": "heuristic_token_estimate",
+    }
 
 
 def _publish_pipeline_event(event_type: str, message: str, **extra) -> None:
@@ -248,7 +428,12 @@ def _reset_pipeline_state(
                     "provider": llm_settings.get("provider"),
                     "quick_model": llm_settings.get("quick_model"),
                     "selection_model": llm_settings.get("selection_model"),
+                    "analyst_model": llm_settings.get("analyst_model"),
                     "fundamentals_model": llm_settings.get("fundamentals_model"),
+                    "research_model": llm_settings.get("research_model"),
+                    "trader_model": llm_settings.get("trader_model"),
+                    "risk_model": llm_settings.get("risk_model"),
+                    "manager_model": llm_settings.get("manager_model"),
                     "deep_model": llm_settings.get("deep_model"),
                 },
             }
@@ -273,10 +458,10 @@ def _set_pipeline_stage(stage: str, status: str, message: str = "") -> None:
         stage_state["message"] = message
         if status == "running" and stage_state["started_at"] is None:
             stage_state["started_at"] = timestamp
-        if status in {"completed", "failed", "skipped"}:
+        if status in {"completed", "failed", "skipped", "stopped"}:
             stage_state["finished_at"] = timestamp
         _PIPELINE_STATE["current_stage"] = stage if status == "running" else _PIPELINE_STATE.get("current_stage")
-        if status in {"completed", "failed"} and _PIPELINE_STATE.get("current_stage") == stage:
+        if status in {"completed", "failed", "stopped"} and _PIPELINE_STATE.get("current_stage") == stage:
             _PIPELINE_STATE["current_stage"] = None
 
     _publish_pipeline_event(
@@ -356,7 +541,7 @@ def _update_pipeline_ticker(
                 ticker_state["status"] = status
                 if status == "running" and ticker_state["started_at"] is None:
                     ticker_state["started_at"] = timestamp
-                if status in {"completed", "failed", "skipped"}:
+                if status in {"completed", "failed", "skipped", "stopped"}:
                     ticker_state["finished_at"] = timestamp
             if phase:
                 ticker_state["phase"] = phase
@@ -371,11 +556,11 @@ def _update_pipeline_ticker(
             if log_path is not None:
                 ticker_state["log_path"] = log_path
             _PIPELINE_STATE["current_ticker"] = symbol if ticker_state["status"] == "running" else _PIPELINE_STATE.get("current_ticker")
-            if ticker_state["status"] in {"completed", "failed", "skipped"}:
+            if ticker_state["status"] in {"completed", "failed", "skipped", "stopped"}:
                 _PIPELINE_STATE["tickers_completed"] = sum(
                     1
                     for item in _PIPELINE_STATE["tickers"]
-                    if item["status"] in {"completed", "failed", "skipped"}
+                    if item["status"] in {"completed", "failed", "skipped", "stopped"}
                 )
                 if _PIPELINE_STATE.get("current_ticker") == symbol:
                     _PIPELINE_STATE["current_ticker"] = None
@@ -409,6 +594,98 @@ def _mark_pipeline_finished(status: str, reason: Optional[str]) -> None:
         status=status,
         reason=reason,
     )
+
+
+def _mark_pipeline_stop_requested(reason: str) -> None:
+    timestamp = _pipeline_now()
+    with _PIPELINE_STATE_LOCK:
+        _PIPELINE_STATE["stop_requested"] = True
+        _PIPELINE_STATE["stop_requested_at"] = timestamp
+
+    _publish_pipeline_event(
+        "stop_requested",
+        reason,
+        reason=reason,
+        requested_at=timestamp,
+    )
+
+
+def _mark_pending_tickers_stopped(reason: str) -> None:
+    with _PIPELINE_STATE_LOCK:
+        pending_symbols = [
+            item["symbol"]
+            for item in _PIPELINE_STATE["tickers"]
+            if item["status"] in {"pending", "running"}
+        ]
+
+    for symbol in pending_symbols:
+        _update_pipeline_ticker(
+            symbol,
+            status="stopped",
+            phase="stopped",
+            reason=reason,
+        )
+
+
+def _snapshot_stop_request() -> dict:
+    with _STOP_REQUEST_LOCK:
+        return dict(_STOP_REQUEST)
+
+
+def _clear_stop_request() -> None:
+    with _STOP_REQUEST_LOCK:
+        _STOP_REQUEST.update(
+            {
+                "requested": False,
+                "requested_at": None,
+                "reason": None,
+            }
+        )
+
+
+def _request_stop(reason: str = "manual_stop_requested") -> tuple[bool, dict]:
+    with _RUN_STATE_LOCK:
+        active = _RUN_STATE["active"]
+
+    if not active:
+        return False, {
+            "status": "rejected",
+            "reason": "no_active_run",
+            "run_state": _snapshot_run_state(),
+        }
+
+    with _STOP_REQUEST_LOCK:
+        if _STOP_REQUEST["requested"]:
+            return False, {
+                "status": "rejected",
+                "reason": "stop_already_requested",
+                "stop_state": dict(_STOP_REQUEST),
+                "run_state": _snapshot_run_state(),
+            }
+        _STOP_REQUEST.update(
+            {
+                "requested": True,
+                "requested_at": datetime.now(timezone.utc).isoformat(),
+                "reason": reason,
+            }
+        )
+        stop_state = dict(_STOP_REQUEST)
+
+    _mark_pipeline_stop_requested(reason)
+    return True, {
+        "status": "accepted",
+        "reason": reason,
+        "stop_state": stop_state,
+        "run_state": _snapshot_run_state(),
+    }
+
+
+def _raise_if_stop_requested(reason: str = "manual_stop_requested") -> None:
+    stop_state = _snapshot_stop_request()
+    if stop_state.get("requested"):
+        stop_reason = stop_state.get("reason") or reason
+        _mark_pending_tickers_stopped(stop_reason)
+        raise StopRequestedError(stop_reason)
 
 
 class TelegramNotifier:
@@ -561,14 +838,23 @@ def _build_telegram_summary(
         f"- reddedilen kararlar: {result_summary['rejected']}",
         "",
         "Agentlar / Modeller / Gorevler",
-        "- market/social/news/bull/bear/trader/risk -> QUICK_MODEL",
-        "- fundamentals -> FUNDAMENTALS_MODEL",
-        "- research_manager/portfolio_manager -> DEEP_MODEL",
+        f"- secim -> {llm_settings.get('selection_model', llm_settings['quick_model'])}",
+        f"- market/social/news -> {llm_settings.get('analyst_model', llm_settings['quick_model'])}",
+        f"- fundamentals -> {llm_settings['fundamentals_model']}",
+        f"- bull/bear -> {llm_settings.get('research_model', llm_settings['quick_model'])}",
+        f"- trader/risk -> {llm_settings.get('trader_model', llm_settings['quick_model'])} / {llm_settings.get('risk_model', llm_settings['quick_model'])}",
+        f"- research_manager/portfolio_manager -> {llm_settings.get('manager_model', llm_settings['deep_model'])}",
+        f"- fallback deep -> {llm_settings['deep_model']}",
         f"LLM_PROVIDER: {llm_settings['provider']}",
         f"BACKEND_URL: {llm_settings['backend_url']}",
         f"QUICK_MODEL: {llm_settings['quick_model']}",
         f"SELECTION_MODEL: {llm_settings.get('selection_model', llm_settings['quick_model'])}",
+        f"ANALYST_MODEL: {llm_settings.get('analyst_model', llm_settings['quick_model'])}",
         f"FUNDAMENTALS_MODEL: {llm_settings['fundamentals_model']}",
+        f"RESEARCH_MODEL: {llm_settings.get('research_model', llm_settings['quick_model'])}",
+        f"TRADER_MODEL: {llm_settings.get('trader_model', llm_settings['quick_model'])}",
+        f"RISK_MODEL: {llm_settings.get('risk_model', llm_settings['quick_model'])}",
+        f"MANAGER_MODEL: {llm_settings.get('manager_model', llm_settings['deep_model'])}",
         f"DEEP_MODEL: {llm_settings['deep_model']}",
         "",
         "Aday Secimi",
@@ -882,22 +1168,39 @@ def _resolve_llm_settings() -> dict:
 
     default_quick_model = DEFAULT_CONFIG["quick_think_llm"]
     default_deep_model = DEFAULT_CONFIG["deep_think_llm"]
+    default_selection_model = default_quick_model
+    default_analyst_model = default_quick_model
+    default_research_model = default_quick_model
+    default_trader_model = default_quick_model
+    default_risk_model = default_quick_model
+    default_manager_model = default_deep_model
     default_fundamentals_model = default_deep_model
 
     if provider == "openrouter":
-        default_quick_model = "anthropic/claude-sonnet-4.6"
+        default_quick_model = "google/gemini-3.1-flash"
         default_deep_model = "openai/gpt-5.4"
-        default_fundamentals_model = "google/gemini-3.1-pro-preview"
+        default_selection_model = "google/gemini-3.1-flash"
+        default_analyst_model = "google/gemini-3.1-flash"
+        default_fundamentals_model = "google/gemini-3.1-flash"
+        default_research_model = "openai/gpt-5.4-mini"
+        default_trader_model = "openai/gpt-5.4-mini"
+        default_risk_model = "openai/gpt-5.4-mini"
+        default_manager_model = "openai/gpt-5.4-mini"
 
     quick_model = _get_env_str("QUICK_MODEL", default_quick_model)
     return {
         "provider": provider,
         "backend_url": backend_url,
         "quick_model": quick_model,
-        "selection_model": _get_env_str("AGENTIC_SELECTION_MODEL", quick_model),
+        "selection_model": _get_env_str("AGENTIC_SELECTION_MODEL", default_selection_model or quick_model),
+        "analyst_model": _get_env_str("ANALYST_MODEL", default_analyst_model or quick_model),
         "fundamentals_model": _get_env_str(
             "FUNDAMENTALS_MODEL", default_fundamentals_model
         ),
+        "research_model": _get_env_str("RESEARCH_MODEL", default_research_model or quick_model),
+        "trader_model": _get_env_str("TRADER_MODEL", default_trader_model or quick_model),
+        "risk_model": _get_env_str("RISK_MODEL", default_risk_model or quick_model),
+        "manager_model": _get_env_str("MANAGER_MODEL", default_manager_model or default_deep_model),
         "deep_model": _get_env_str("DEEP_MODEL", default_deep_model),
     }
 
@@ -912,7 +1215,18 @@ def _build_ta_config() -> dict:
     cfg["quick_think_llm"] = llm_settings["quick_model"]
     cfg["deep_think_llm"] = llm_settings["deep_model"]
     cfg["role_llm_models"] = {
+        "market": llm_settings["analyst_model"],
+        "social": llm_settings["analyst_model"],
+        "news": llm_settings["analyst_model"],
         "fundamentals": llm_settings["fundamentals_model"],
+        "bull_researcher": llm_settings["research_model"],
+        "bear_researcher": llm_settings["research_model"],
+        "research_manager": llm_settings["manager_model"],
+        "trader": llm_settings["trader_model"],
+        "aggressive_analyst": llm_settings["risk_model"],
+        "neutral_analyst": llm_settings["risk_model"],
+        "conservative_analyst": llm_settings["risk_model"],
+        "portfolio_manager": llm_settings["manager_model"],
     }
     cfg["max_debate_rounds"] = 1
     cfg["max_risk_discuss_rounds"] = 1
@@ -952,6 +1266,7 @@ def _snapshot_run_state() -> dict:
 
 
 def _mark_run_started(session_name: str, trigger_source: str) -> None:
+    _clear_stop_request()
     with _RUN_STATE_LOCK:
         _RUN_STATE["active"] = True
         _RUN_STATE["current"] = {
@@ -975,6 +1290,7 @@ def _mark_run_finished(status: str, reason: Optional[str]) -> None:
         }
         _RUN_STATE["active"] = False
         _RUN_STATE["current"] = None
+    _clear_stop_request()
     _mark_pipeline_finished(status, reason)
 
 
@@ -997,6 +1313,7 @@ def _get_http_port() -> int:
 
 def _build_health_payload() -> dict:
     run_state = _snapshot_run_state()
+    stop_state = _snapshot_stop_request()
     current = run_state.get("current") or {}
     last = run_state.get("last") or {}
     return {
@@ -1014,14 +1331,19 @@ def _build_health_payload() -> dict:
             "last_trigger_source": last.get("trigger_source"),
             "last_started_at": last.get("started_at"),
             "last_finished_at": last.get("finished_at"),
+            "stop_requested": stop_state.get("requested", False),
+            "stop_requested_at": stop_state.get("requested_at"),
+            "stop_reason": stop_state.get("reason"),
         },
     }
 
 
 def _build_pipeline_payload() -> dict:
+    pipeline_state = _snapshot_pipeline_state()
+    pipeline_state["telemetry"] = _build_pipeline_telemetry(pipeline_state)
     return {
         "status": "ok",
-        "pipeline": _snapshot_pipeline_state(),
+        "pipeline": pipeline_state,
     }
 
 
@@ -1054,6 +1376,15 @@ def _run_reserved_job(session_name: str, trigger_source: str) -> dict:
         )
         _mark_run_finished(result["status"], result.get("reason"))
         return result
+    except StopRequestedError as exc:
+        logger.info(
+            "Trading job stopped safely: session=%s source=%s reason=%s",
+            session_name,
+            trigger_source,
+            exc,
+        )
+        _mark_run_finished("stopped", str(exc))
+        return {"status": "stopped", "reason": str(exc)}
     except Exception as exc:
         logger.error(
             "Trading job failed: session=%s source=%s error=%s",
@@ -1121,6 +1452,9 @@ class WorkerHttpHandler(BaseHTTPRequestHandler):
         if parsed.path == "/trigger":
             self._handle_trigger(parsed)
             return
+        if parsed.path == "/stop":
+            self._handle_stop(parsed)
+            return
         self._write_json(404, {"status": "not_found"})
 
     def log_message(self, fmt: str, *args) -> None:
@@ -1133,6 +1467,12 @@ class WorkerHttpHandler(BaseHTTPRequestHandler):
             session_name=session_name,
             trigger_source="http",
         )
+        self._write_json(202 if accepted else 409, payload)
+
+    def _handle_stop(self, parsed) -> None:
+        params = parse_qs(parsed.query)
+        reason = params.get("reason", ["manual_stop_requested"])[0].strip() or "manual_stop_requested"
+        accepted, payload = _request_stop(reason)
         self._write_json(202 if accepted else 409, payload)
 
     def _handle_pipeline_events(self) -> None:
@@ -1243,6 +1583,7 @@ def _execute_trading_job(
     executor = AlpacaExecutor()
     notifier = TelegramNotifier()
     executor.reset_session_guard()
+    _raise_if_stop_requested()
     tickers, discovery_context = _resolve_analysis_tickers(executor, today)
     _set_pipeline_discovery_context(discovery_context)
     if not tickers:
@@ -1250,6 +1591,7 @@ def _execute_trading_job(
         _set_pipeline_stage("analysis", "failed", "No tickers resolved for this run.")
         return {"status": "skipped", "reason": "no_tickers"}
 
+    _raise_if_stop_requested()
     _set_pipeline_tickers(tickers)
     _set_pipeline_stage("analysis", "running", f"Analysing {len(tickers)} ticker(s).")
 
@@ -1270,6 +1612,7 @@ def _execute_trading_job(
 
     # Sanity check: verify Alpaca connection
     try:
+        _raise_if_stop_requested()
         account = executor.get_account()
         logger.info(
             "Alpaca account: status=%s buying_power=%s",
@@ -1293,6 +1636,7 @@ def _execute_trading_job(
     execution_stage_started = False
 
     for ticker in tickers:
+        _raise_if_stop_requested()
         logger.info("Analysing %s ...", ticker)
         _update_pipeline_ticker(ticker, status="running", phase="analysis", log_path=(
             f"eval_results/{ticker}/TradingAgentsStrategy_logs/"
@@ -1321,7 +1665,10 @@ def _execute_trading_job(
                     err[:200],
                 )
                 if attempt < retries - 1:
+                    _raise_if_stop_requested()
                     time.sleep(3 * (attempt + 1))
+
+        _raise_if_stop_requested()
 
         if signal in executor.BUY_SIGNALS and new_buys_placed >= max_new_buys:
             logger.info(
@@ -1350,9 +1697,11 @@ def _execute_trading_job(
             continue
 
         if not execution_stage_started:
+            _raise_if_stop_requested()
             _set_pipeline_stage("execution", "running", "Evaluating portfolio actions.")
             execution_stage_started = True
 
+        _raise_if_stop_requested()
         execution = executor.execute_with_details(ticker, signal)
         order = execution.get("order")
         if order:
@@ -1415,6 +1764,7 @@ def _execute_trading_job(
 
     # Send compact run summary to Telegram after each scan.
     try:
+        _raise_if_stop_requested()
         _set_pipeline_stage("summary", "running", "Building and sending Telegram summary.")
         logger.info("Preparing Telegram summary...")
         account_end = executor.get_account()

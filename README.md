@@ -140,8 +140,13 @@ cp .env.example .env
 
 For OpenRouter-backed autonomous scans, you can also override the lightweight shortlist selector independently:
 ```bash
-export QUICK_MODEL=anthropic/claude-sonnet-4.6
-export FUNDAMENTALS_MODEL=google/gemini-3.1-pro-preview
+export QUICK_MODEL=google/gemini-3.1-flash
+export ANALYST_MODEL=google/gemini-3.1-flash
+export FUNDAMENTALS_MODEL=google/gemini-3.1-flash
+export RESEARCH_MODEL=openai/gpt-5.4-mini
+export TRADER_MODEL=openai/gpt-5.4-mini
+export RISK_MODEL=openai/gpt-5.4-mini
+export MANAGER_MODEL=openai/gpt-5.4-mini
 export DEEP_MODEL=openai/gpt-5.4
 export AGENTIC_SELECTION_MODEL=openai/gpt-5.4-mini
 ```
@@ -179,9 +184,10 @@ GET  /pipeline-state    current in-memory pipeline snapshot
 GET  /events/pipeline   server-sent event stream for live updates
 GET  /dashboard         realtime monitoring UI
 POST /trigger           trigger a new run
+POST /stop              request a safe stop at the next checkpoint
 ```
 
-When the worker is running locally or on Railway, open `/dashboard` to watch the pipeline stages, selected symbols, per-ticker progress, and recent events update live in the browser.
+When the worker is running locally or on Railway, open `/dashboard` to watch the pipeline stages, selected symbols, per-ticker progress, recent events, and current model routing update live in the browser. The Safe Stop control does not kill the process mid-call; it asks the worker to stop cleanly before the next ticker or execution checkpoint.
 
 ## TradingAgents Package
 

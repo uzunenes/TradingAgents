@@ -86,6 +86,31 @@ class TestIntradayWorkerHelpers(unittest.TestCase):
         self.assertEqual(status_code, 202)
         self.assertEqual(payload["status"], "accepted")
 
+    def test_http_stop_endpoint_accepts_safe_stop(self):
+        with patch.object(
+            worker,
+            "_request_stop",
+            return_value=(True, {"status": "accepted", "reason": "dashboard_safe_stop"}),
+        ):
+            server = worker._build_http_server("127.0.0.1", 0)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                port = server.server_address[1]
+                request = Request(
+                    f"http://127.0.0.1:{port}/stop?reason=dashboard_safe_stop",
+                    method="POST",
+                )
+                with urlopen(request) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                    status_code = response.status
+            finally:
+                server.shutdown()
+                server.server_close()
+
+        self.assertEqual(status_code, 202)
+        self.assertEqual(payload["status"], "accepted")
+
     def test_pipeline_state_endpoint_reports_pipeline_snapshot(self):
         worker._reset_pipeline_state(
             run_id="run-1",
@@ -117,6 +142,8 @@ class TestIntradayWorkerHelpers(unittest.TestCase):
         self.assertEqual(payload["pipeline"]["run_id"], "run-1")
         self.assertEqual(payload["pipeline"]["stages"]["analysis"]["status"], "running")
         self.assertEqual(payload["pipeline"]["llm_settings"]["selection_model"], "mini")
+        self.assertIn("telemetry", payload["pipeline"])
+        self.assertIn("total_estimated_cost_usd", payload["pipeline"]["telemetry"])
 
     def test_dashboard_route_serves_html(self):
         server = worker._build_http_server("127.0.0.1", 0)
@@ -135,13 +162,14 @@ class TestIntradayWorkerHelpers(unittest.TestCase):
         self.assertEqual(status_code, 200)
         self.assertIn("text/html", content_type)
         self.assertIn("Realtime Pipeline Monitor", body)
+        self.assertIn("Telemetry", body)
 
     def test_selection_model_defaults_to_quick_model_when_unset(self):
         with patch.dict(
             os.environ,
             {
                 "LLM_PROVIDER": "openrouter",
-                "QUICK_MODEL": "anthropic/claude-sonnet-4.6",
+                "QUICK_MODEL": "google/gemini-3.1-flash",
                 "AGENTIC_SELECTION_MODEL": "",
             },
             clear=False,
@@ -149,6 +177,112 @@ class TestIntradayWorkerHelpers(unittest.TestCase):
             settings = worker._resolve_llm_settings()
 
         self.assertEqual(settings["selection_model"], settings["quick_model"])
+
+    def test_openrouter_role_models_default_to_cheaper_split(self):
+        with patch.dict(
+            os.environ,
+            {
+                "LLM_PROVIDER": "openrouter",
+                "QUICK_MODEL": "",
+                "AGENTIC_SELECTION_MODEL": "",
+                "ANALYST_MODEL": "",
+                "FUNDAMENTALS_MODEL": "",
+                "RESEARCH_MODEL": "",
+                "TRADER_MODEL": "",
+                "RISK_MODEL": "",
+                "MANAGER_MODEL": "",
+                "DEEP_MODEL": "",
+            },
+            clear=False,
+        ):
+            settings = worker._resolve_llm_settings()
+
+        self.assertEqual(settings["quick_model"], "google/gemini-3.1-flash")
+        self.assertEqual(settings["analyst_model"], "google/gemini-3.1-flash")
+        self.assertEqual(settings["fundamentals_model"], "google/gemini-3.1-flash")
+        self.assertEqual(settings["research_model"], "openai/gpt-5.4-mini")
+        self.assertEqual(settings["manager_model"], "openai/gpt-5.4-mini")
+        self.assertEqual(settings["deep_model"], "openai/gpt-5.4")
+
+    def test_build_ta_config_maps_role_specific_models(self):
+        with patch.object(
+            worker,
+            "_resolve_llm_settings",
+            return_value={
+                "provider": "openrouter",
+                "backend_url": "https://openrouter.ai/api/v1",
+                "quick_model": "quick",
+                "selection_model": "selection",
+                "analyst_model": "analyst",
+                "fundamentals_model": "fundamentals",
+                "research_model": "research",
+                "trader_model": "trader",
+                "risk_model": "risk",
+                "manager_model": "manager",
+                "deep_model": "deep",
+            },
+        ):
+            config = worker._build_ta_config()
+
+        self.assertEqual(config["role_llm_models"]["market"], "analyst")
+        self.assertEqual(config["role_llm_models"]["fundamentals"], "fundamentals")
+        self.assertEqual(config["role_llm_models"]["bull_researcher"], "research")
+        self.assertEqual(config["role_llm_models"]["trader"], "trader")
+        self.assertEqual(config["role_llm_models"]["aggressive_analyst"], "risk")
+        self.assertEqual(config["role_llm_models"]["portfolio_manager"], "manager")
+
+    def test_build_pipeline_telemetry_exposes_duration_and_cost_estimates(self):
+        pipeline_state = {
+            "started_at": "2026-04-01T14:00:00+00:00",
+            "finished_at": "2026-04-01T14:10:00+00:00",
+            "tickers": [
+                {
+                    "symbol": "MSFT",
+                    "status": "completed",
+                    "started_at": "2026-04-01T14:01:00+00:00",
+                    "finished_at": "2026-04-01T14:05:00+00:00",
+                },
+                {
+                    "symbol": "NVDA",
+                    "status": "running",
+                    "started_at": "2026-04-01T14:05:00+00:00",
+                    "finished_at": None,
+                },
+            ],
+            "stages": {
+                "analysis": {
+                    "status": "completed",
+                    "started_at": "2026-04-01T14:01:00+00:00",
+                    "finished_at": "2026-04-01T14:08:00+00:00",
+                },
+                "selection": {
+                    "status": "completed",
+                    "started_at": "2026-04-01T14:00:10+00:00",
+                    "finished_at": "2026-04-01T14:00:30+00:00",
+                },
+            },
+            "llm_settings": {
+                "selection_model": "openai/gpt-5.4-mini",
+                "analyst_model": "google/gemini-3.1-flash",
+                "fundamentals_model": "google/gemini-3.1-flash",
+                "research_model": "openai/gpt-5.4-mini",
+                "trader_model": "openai/gpt-5.4-mini",
+                "risk_model": "openai/gpt-5.4-mini",
+                "manager_model": "openai/gpt-5.4-mini",
+            },
+            "discovery_context": {
+                "universe_mode": "sp500",
+                "ranked_symbols": ["MSFT", "NVDA", "AAPL"],
+            },
+        }
+
+        telemetry = worker._build_pipeline_telemetry(pipeline_state)
+
+        self.assertEqual(telemetry["run_duration_seconds"], 600.0)
+        self.assertGreater(telemetry["total_estimated_cost_usd"], 0.0)
+        self.assertGreater(telemetry["remaining_estimated_cost_usd"], 0.0)
+        self.assertEqual(telemetry["stage_durations"]["analysis"]["duration_seconds"], 420.0)
+        self.assertEqual(telemetry["ticker_durations"]["MSFT"]["duration_seconds"], 240.0)
 
     def test_health_payload_is_flat_and_stable(self):
         with patch.object(

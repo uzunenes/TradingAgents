@@ -84,6 +84,12 @@ h2 {
   align-items: center;
 }
 
+.control-group {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 .badge,
 button {
   border-radius: 999px;
@@ -98,6 +104,11 @@ button {
   cursor: pointer;
 }
 
+.button-secondary {
+  background: #f6ede2;
+  color: #3a2b20;
+}
+
 button:disabled {
   opacity: 0.6;
   cursor: wait;
@@ -107,6 +118,7 @@ button:disabled {
 .badge-running { background: #fde0c6; }
 .badge-completed { background: #d8efdf; }
 .badge-failed { background: #f7d8d4; }
+.badge-stopped { background: #ece1d3; }
 
 .summary-grid,
 .grid-two {
@@ -116,7 +128,7 @@ button:disabled {
 }
 
 .summary-grid {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 .grid-two {
@@ -206,8 +218,10 @@ dd {
 .status-completed { background: rgba(45, 138, 92, 0.18); }
 .status-failed { background: rgba(199, 73, 58, 0.18); }
 .status-skipped { background: rgba(144, 125, 105, 0.18); }
+.status-stopped { background: rgba(103, 88, 74, 0.16); }
 
 .stage-card p,
+.stage-meta,
 .ticker-meta,
 .event-card p {
   color: var(--muted);

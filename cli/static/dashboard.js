@@ -2,6 +2,10 @@ const state = {
   eventSource: null,
 };
 
+function isTerminalStatus(status) {
+  return ["completed", "failed", "stopped", "skipped"].includes(status || "");
+}
+
 function setText(id, value) {
   const el = document.getElementById(id);
   if (el) {
@@ -13,14 +17,40 @@ function statusClass(status) {
   return `status-${status || "pending"}`;
 }
 
+function formatDuration(seconds) {
+  if (seconds == null || Number.isNaN(seconds)) {
+    return "-";
+  }
+  if (seconds < 60) {
+    return `${Math.round(seconds)}s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = Math.round(seconds % 60);
+  if (minutes < 60) {
+    return `${minutes}m ${remainingSeconds}s`;
+  }
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return `${hours}h ${remainingMinutes}m`;
+}
+
+function formatUsd(value) {
+  if (value == null || Number.isNaN(value)) {
+    return "-";
+  }
+  return `$${Number(value).toFixed(value < 0.01 ? 4 : 2)}`;
+}
+
 function renderStages(pipeline) {
   const flow = document.getElementById("stage-flow");
   const stages = Object.values(pipeline.stages || {});
+  const durations = pipeline.telemetry?.stage_durations || {};
   flow.innerHTML = stages.map((stage) => `
     <article class="stage-card">
       <span class="stage-status ${statusClass(stage.status)}">${stage.status}</span>
       <h3>${stage.label}</h3>
       <p>${stage.message || "waiting"}</p>
+      <p class="stage-meta">duration: ${formatDuration(durations[stage.key]?.duration_seconds)}</p>
     </article>
   `).join("");
 }
@@ -28,6 +58,7 @@ function renderStages(pipeline) {
 function renderTickers(pipeline) {
   const grid = document.getElementById("ticker-grid");
   const tickers = pipeline.tickers || [];
+  const telemetry = pipeline.telemetry?.ticker_durations || {};
   if (!tickers.length) {
     grid.innerHTML = '<p class="subtle">No tickers yet.</p>';
     return;
@@ -40,6 +71,8 @@ function renderTickers(pipeline) {
       <p class="ticker-meta">phase: ${ticker.phase || "pending"}</p>
       <p class="ticker-meta">signal: ${ticker.signal || "-"}</p>
       <p class="ticker-meta">action: ${ticker.action || "-"}</p>
+      <p class="ticker-meta">duration: ${formatDuration(telemetry[ticker.symbol]?.duration_seconds)}</p>
+      <p class="ticker-meta">est. cost: ${formatUsd(telemetry[ticker.symbol]?.estimated_cost_usd)}</p>
     </article>
   `).join("");
 }
@@ -64,27 +97,40 @@ function renderEvents(pipeline) {
 function renderPipeline(payload) {
   const pipeline = payload.pipeline || {};
   const status = pipeline.status || "idle";
+  const stopRequested = Boolean(pipeline.stop_requested);
 
   setText("run-status", status);
   setText("run-session", pipeline.session_name || "-");
   setText("run-id", pipeline.run_id || "-");
   setText("run-current", pipeline.current_ticker || pipeline.current_stage || "-");
+  setText("run-stop", stopRequested ? `requested at ${pipeline.stop_requested_at || "-"}` : "not requested");
   setText("model-quick", pipeline.llm_settings?.quick_model || "-");
   setText("model-selection", pipeline.llm_settings?.selection_model || "-");
+  setText("model-analyst", pipeline.llm_settings?.analyst_model || "-");
   setText("model-fundamentals", pipeline.llm_settings?.fundamentals_model || "-");
+  setText("model-research", pipeline.llm_settings?.research_model || "-");
+  setText("model-trader", pipeline.llm_settings?.trader_model || "-");
+  setText("model-risk", pipeline.llm_settings?.risk_model || "-");
+  setText("model-manager", pipeline.llm_settings?.manager_model || "-");
   setText("model-deep", pipeline.llm_settings?.deep_model || "-");
   setText("discovery-mode", pipeline.discovery_context?.universe_mode || "-");
   setText("discovery-selected", (pipeline.discovery_context?.selected_symbols || []).join(", ") || "-");
   setText("discovery-held", (pipeline.discovery_context?.held_symbols || []).join(", ") || "-");
   setText("discovery-reason", pipeline.discovery_context?.selection_reason || "-");
   setText("pipeline-totals", `${pipeline.tickers_completed || 0} / ${pipeline.tickers_total || 0} tickers completed`);
+  setText("telemetry-run-duration", formatDuration(pipeline.telemetry?.run_duration_seconds));
+  setText("telemetry-completed-cost", formatUsd(pipeline.telemetry?.completed_estimated_cost_usd));
+  setText("telemetry-remaining-cost", formatUsd(pipeline.telemetry?.remaining_estimated_cost_usd));
+  setText("telemetry-total-cost", formatUsd(pipeline.telemetry?.total_estimated_cost_usd));
 
   const badge = document.getElementById("connection-badge");
   badge.textContent = status;
-  badge.className = `badge badge-${status === "running" ? "running" : status === "completed" ? "completed" : status === "failed" ? "failed" : "idle"}`;
+  badge.className = `badge badge-${status === "running" ? "running" : status === "completed" ? "completed" : status === "failed" ? "failed" : status === "stopped" ? "stopped" : "idle"}`;
 
   const triggerButton = document.getElementById("trigger-button");
+  const stopButton = document.getElementById("stop-button");
   triggerButton.disabled = status === "running";
+  stopButton.disabled = status !== "running" || stopRequested || isTerminalStatus(status);
 
   renderStages(pipeline);
   renderTickers(pipeline);
@@ -109,6 +155,15 @@ async function triggerRun() {
   await fetchPipeline();
 }
 
+async function stopRun() {
+  const response = await fetch("/stop?reason=dashboard_safe_stop", { method: "POST" });
+  const payload = await response.json();
+  if (!response.ok && response.status !== 202 && response.status !== 409) {
+    throw new Error(payload.reason || `stop ${response.status}`);
+  }
+  await fetchPipeline();
+}
+
 function connectEvents() {
   if (!("EventSource" in window)) {
     setInterval(() => {
@@ -129,6 +184,12 @@ function connectEvents() {
 
 document.getElementById("trigger-button").addEventListener("click", () => {
   triggerRun().catch((error) => {
+    console.error(error);
+  });
+});
+
+document.getElementById("stop-button").addEventListener("click", () => {
+  stopRun().catch((error) => {
     console.error(error);
   });
 });

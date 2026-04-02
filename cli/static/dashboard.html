@@ -16,7 +16,10 @@
       </div>
       <div class="hero-meta">
         <span id="connection-badge" class="badge badge-idle">idle</span>
-        <button id="trigger-button" type="button">Trigger Run</button>
+        <div class="control-group">
+          <button id="trigger-button" type="button">Trigger Run</button>
+          <button id="stop-button" class="button-secondary" type="button">Safe Stop</button>
+        </div>
       </div>
     </header>
 
@@ -28,6 +31,7 @@
           <div><dt>Session</dt><dd id="run-session">-</dd></div>
           <div><dt>Run ID</dt><dd id="run-id">-</dd></div>
           <div><dt>Current</dt><dd id="run-current">-</dd></div>
+          <div><dt>Stop</dt><dd id="run-stop">-</dd></div>
         </dl>
       </article>
       <article>
@@ -35,7 +39,12 @@
         <dl>
           <div><dt>Quick</dt><dd id="model-quick">-</dd></div>
           <div><dt>Selection</dt><dd id="model-selection">-</dd></div>
+          <div><dt>Analyst</dt><dd id="model-analyst">-</dd></div>
           <div><dt>Fundamentals</dt><dd id="model-fundamentals">-</dd></div>
+          <div><dt>Research</dt><dd id="model-research">-</dd></div>
+          <div><dt>Trader</dt><dd id="model-trader">-</dd></div>
+          <div><dt>Risk</dt><dd id="model-risk">-</dd></div>
+          <div><dt>Manager</dt><dd id="model-manager">-</dd></div>
           <div><dt>Deep</dt><dd id="model-deep">-</dd></div>
         </dl>
       </article>
@@ -46,6 +55,15 @@
           <div><dt>Selected</dt><dd id="discovery-selected">-</dd></div>
           <div><dt>Held</dt><dd id="discovery-held">-</dd></div>
           <div><dt>Reason</dt><dd id="discovery-reason">-</dd></div>
+        </dl>
+      </article>
+      <article>
+        <h2>Telemetry</h2>
+        <dl>
+          <div><dt>Elapsed</dt><dd id="telemetry-run-duration">-</dd></div>
+          <div><dt>Completed Cost</dt><dd id="telemetry-completed-cost">-</dd></div>
+          <div><dt>Remaining Cost</dt><dd id="telemetry-remaining-cost">-</dd></div>
+          <div><dt>Total Cost</dt><dd id="telemetry-total-cost">-</dd></div>
         </dl>
       </article>
     </section>
