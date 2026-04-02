@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -105,3 +105,24 @@ class TestWorkerPortfolioManagement(unittest.TestCase):
         self.assertIn("portfoyden dahil edilenler: AAPL", summary)
         self.assertIn("aksiyon=alim emri gonderildi", summary)
         self.assertIn("neden=azaltilacak long pozisyon yok, short acilmadi", summary)
+        self.assertNotIn("BACKEND_URL:", summary)
+        self.assertNotIn("log=eval_results", summary)
+
+    def test_telegram_notifier_splits_long_messages_without_truncation(self):
+        notifier = worker.TelegramNotifier()
+        notifier.enabled = True
+        notifier.token = "token"
+        notifier.chat_ids = ["chat-1"]
+
+        long_message = "\n".join(f"satir {index}: " + ("x" * 120) for index in range(60))
+        fake_response = Mock()
+        fake_response.raise_for_status.return_value = None
+        fake_response.json.return_value = {"result": {"message_id": 1}}
+
+        with patch("worker.requests.post", return_value=fake_response) as post_mock:
+            notifier.send(long_message)
+
+        self.assertGreater(post_mock.call_count, 1)
+        sent_parts = [call.kwargs["json"]["text"] for call in post_mock.call_args_list]
+        self.assertEqual("".join(part.replace("\n", "") for part in sent_parts).count("satir"), 60)
+        self.assertTrue(all(len(part) <= notifier.MAX_MESSAGE_LEN for part in sent_parts))

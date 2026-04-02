@@ -911,6 +911,8 @@ def _raise_if_stop_requested(reason: str = "manual_stop_requested") -> None:
 class TelegramNotifier:
     """Send compact post-run summaries to configured Telegram chat IDs."""
 
+    MAX_MESSAGE_LEN = 3900
+
     def __init__(self) -> None:
         self.enabled = _get_env_bool("TELEGRAM_ENABLED", False)
         self.token = _get_env_str("TELEGRAM_BOT_TOKEN", "") or ""
@@ -920,45 +922,110 @@ class TelegramNotifier:
     def is_configured(self) -> bool:
         return self.enabled and bool(self.token) and bool(self.chat_ids)
 
+    def _split_message(self, message: str) -> list[str]:
+        text = (message or "").strip()
+        if not text:
+            return []
+        if len(text) <= self.MAX_MESSAGE_LEN:
+            return [text]
+
+        chunks: list[str] = []
+        current_lines: list[str] = []
+        current_len = 0
+
+        def flush() -> None:
+            nonlocal current_lines, current_len
+            if current_lines:
+                chunks.append("\n".join(current_lines).strip())
+                current_lines = []
+                current_len = 0
+
+        for line in text.splitlines():
+            candidate_len = current_len + len(line) + (1 if current_lines else 0)
+            if candidate_len <= self.MAX_MESSAGE_LEN:
+                current_lines.append(line)
+                current_len = candidate_len
+                continue
+
+            if current_lines:
+                flush()
+
+            if len(line) <= self.MAX_MESSAGE_LEN:
+                current_lines.append(line)
+                current_len = len(line)
+                continue
+
+            start = 0
+            while start < len(line):
+                end = min(start + self.MAX_MESSAGE_LEN, len(line))
+                if end < len(line):
+                    split_at = line.rfind(" ", start, end)
+                    if split_at > start:
+                        end = split_at
+                chunks.append(line[start:end].strip())
+                start = end if end > start else start + self.MAX_MESSAGE_LEN
+                while start < len(line) and line[start] == " ":
+                    start += 1
+
+        flush()
+        if len(chunks) == 1:
+            return chunks
+
+        total = len(chunks)
+        decorated = []
+        for index, chunk in enumerate(chunks, start=1):
+            header = f"[{index}/{total}]\n"
+            if len(header) + len(chunk) <= self.MAX_MESSAGE_LEN:
+                decorated.append(header + chunk)
+            else:
+                decorated.append(chunk[: self.MAX_MESSAGE_LEN - len(header)] + header)
+        return decorated
+
     def send(self, message: str) -> None:
         if not self.is_configured():
             logger.info("Telegram notifier is disabled or not configured.")
             return
 
-        # Telegram hard limit is 4096 chars per message.
-        text = message[:3900]
+        chunks = self._split_message(message)
         logger.info(
-            "Telegram: starting send to %d chat_id(s), message_size=%d bytes",
+            "Telegram: starting send to %d chat_id(s), parts=%d, total_size=%d bytes",
             len(self.chat_ids),
-            len(text),
+            len(chunks),
+            len(message or ""),
         )
-        logger.debug("Telegram: message preview (first 200 chars):\n%s", text[:200])
+        if chunks:
+            logger.debug("Telegram: message preview (first 200 chars):\n%s", chunks[0][:200])
         
         for idx, chat_id in enumerate(self.chat_ids, 1):
             try:
-                logger.info(
-                    "Telegram: sending to chat_id=%s (%d/%d)...",
-                    chat_id,
-                    idx,
-                    len(self.chat_ids),
-                )
-                resp = requests.post(
-                    f"https://api.telegram.org/bot{self.token}/sendMessage",
-                    json={
-                        "chat_id": chat_id,
-                        "text": text,
-                        "disable_web_page_preview": True,
-                    },
-                    timeout=15,
-                )
-                resp.raise_for_status()
-                result = resp.json()
-                msg_id = result.get("result", {}).get("message_id", "?")
-                logger.info(
-                    "Telegram: SUCCESS sent to chat_id=%s message_id=%s",
-                    chat_id,
-                    msg_id,
-                )
+                for part_idx, text in enumerate(chunks, start=1):
+                    logger.info(
+                        "Telegram: sending to chat_id=%s (%d/%d), part=%d/%d...",
+                        chat_id,
+                        idx,
+                        len(self.chat_ids),
+                        part_idx,
+                        len(chunks),
+                    )
+                    resp = requests.post(
+                        f"https://api.telegram.org/bot{self.token}/sendMessage",
+                        json={
+                            "chat_id": chat_id,
+                            "text": text,
+                            "disable_web_page_preview": True,
+                        },
+                        timeout=15,
+                    )
+                    resp.raise_for_status()
+                    result = resp.json()
+                    msg_id = result.get("result", {}).get("message_id", "?")
+                    logger.info(
+                        "Telegram: SUCCESS sent to chat_id=%s message_id=%s part=%d/%d",
+                        chat_id,
+                        msg_id,
+                        part_idx,
+                        len(chunks),
+                    )
             except Exception as exc:
                 logger.error(
                     "Telegram: FAILED to send to chat_id=%s: %s",
@@ -1040,6 +1107,9 @@ def _build_telegram_summary(
 ) -> str:
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     result_summary = _summarize_run_results(run_results)
+    ticker_preview = ", ".join(tickers[:10]) if tickers else "yok"
+    if len(tickers) > 10:
+        ticker_preview = f"{ticker_preview}, ... +{len(tickers) - 10}"
 
     lines = [
         "TradingAgents Gunluk Ozet",
@@ -1049,7 +1119,7 @@ def _build_telegram_summary(
         f"Calisma kimligi: {run_id}",
         f"Rapor zamani: {now_utc}",
         f"Evren modu: {discovery_context.get('universe_mode', 'fixed')}",
-        f"Incelenen tickerlar ({len(tickers)}): {', '.join(tickers)}",
+        f"Incelenen tickerlar ({len(tickers)}): {ticker_preview}",
         "",
         "Run Ozeti",
         f"- yeni alim emirleri: {result_summary['buy_orders']}",
@@ -1065,17 +1135,7 @@ def _build_telegram_summary(
         f"- trader/risk -> {llm_settings.get('trader_model', llm_settings['quick_model'])} / {llm_settings.get('risk_model', llm_settings['quick_model'])}",
         f"- research_manager/portfolio_manager -> {llm_settings.get('manager_model', llm_settings['deep_model'])}",
         f"- fallback deep -> {llm_settings['deep_model']}",
-        f"LLM_PROVIDER: {llm_settings['provider']}",
-        f"BACKEND_URL: {llm_settings['backend_url']}",
-        f"QUICK_MODEL: {llm_settings['quick_model']}",
-        f"SELECTION_MODEL: {llm_settings.get('selection_model', llm_settings['quick_model'])}",
-        f"ANALYST_MODEL: {llm_settings.get('analyst_model', llm_settings['quick_model'])}",
-        f"FUNDAMENTALS_MODEL: {llm_settings['fundamentals_model']}",
-        f"RESEARCH_MODEL: {llm_settings.get('research_model', llm_settings['quick_model'])}",
-        f"TRADER_MODEL: {llm_settings.get('trader_model', llm_settings['quick_model'])}",
-        f"RISK_MODEL: {llm_settings.get('risk_model', llm_settings['quick_model'])}",
-        f"MANAGER_MODEL: {llm_settings.get('manager_model', llm_settings['deep_model'])}",
-        f"DEEP_MODEL: {llm_settings['deep_model']}",
+        f"- provider -> {llm_settings['provider']}",
         "",
         "Aday Secimi",
     ]
@@ -1128,8 +1188,7 @@ def _build_telegram_summary(
             f"{item.get('ticker')}: "
             f"sinyal={item.get('signal')} | "
             f"aksiyon={_humanize_action(action)} | "
-            f"neden={_humanize_reason(reason)} | "
-            f"log={item.get('log_path', 'n/a')}"
+            f"neden={_humanize_reason(reason)}"
         )
 
     lines.extend(
