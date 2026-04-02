@@ -53,6 +53,7 @@ def select_candidates_with_llm(
     trade_date: str,
     llm_settings: dict[str, str],
     selection_count: int,
+    callbacks: list[Any] | None = None,
 ) -> dict[str, Any]:
     if selection_count <= 0 or not ranked_candidates:
         return {
@@ -78,6 +79,7 @@ def select_candidates_with_llm(
         base_url=llm_settings.get("backend_url"),
         timeout=45,
         max_retries=2,
+        callbacks=callbacks or [],
     ).get_llm()
 
     prompt_lines = [

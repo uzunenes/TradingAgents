@@ -55,12 +55,13 @@ from dataclasses import dataclass
 from datetime import date
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
+from langchain_core.callbacks.base import BaseCallbackHandler
 import requests
 
 
@@ -154,34 +155,24 @@ _PIPELINE_STAGE_META = {
     "execution": "Portfolio Decision",
     "summary": "Order Execution / Summary",
 }
-
-_MODEL_PRICING_PER_1M_TOKENS_USD = {
-    "openai/gpt-5.4": {"input": 30.0, "output": 180.0},
-    "openai/gpt-5.4-mini": {"input": 3.0, "output": 15.0},
-    "openai/gpt-5.4-nano": {"input": 0.6, "output": 2.4},
-    "google/gemini-3.1-flash": {"input": 0.35, "output": 1.05},
-    "google/gemini-3.1-flash-lite-preview": {"input": 0.1, "output": 0.4},
-    "google/gemini-3.1-pro-preview": {"input": 3.5, "output": 10.5},
-    "anthropic/claude-sonnet-4.6": {"input": 3.0, "output": 15.0},
-    "anthropic/claude-sonnet-4-6": {"input": 3.0, "output": 15.0},
-    "claude-sonnet-4-6": {"input": 3.0, "output": 15.0},
+_OPENROUTER_PRICING_CACHE_LOCK = threading.Lock()
+_OPENROUTER_PRICING_CACHE = {
+    "fetched_at": 0.0,
+    "models": {},
 }
+_OPENROUTER_PRICING_TTL_SECONDS = 900
 
-_RUN_COST_ROLE_ASSUMPTIONS = {
-    "selection": {"model_key": "selection_model", "calls": 1, "input_tokens": 2800, "output_tokens": 450},
-    "market": {"model_key": "analyst_model", "calls": 1, "input_tokens": 2800, "output_tokens": 650},
-    "social": {"model_key": "analyst_model", "calls": 1, "input_tokens": 2600, "output_tokens": 650},
-    "news": {"model_key": "analyst_model", "calls": 1, "input_tokens": 2600, "output_tokens": 650},
-    "fundamentals": {"model_key": "fundamentals_model", "calls": 1, "input_tokens": 3200, "output_tokens": 800},
-    "bull_researcher": {"model_key": "research_model", "calls": 1, "input_tokens": 2600, "output_tokens": 650},
-    "bear_researcher": {"model_key": "research_model", "calls": 1, "input_tokens": 2600, "output_tokens": 650},
-    "research_manager": {"model_key": "manager_model", "calls": 1, "input_tokens": 2200, "output_tokens": 450},
-    "trader": {"model_key": "trader_model", "calls": 1, "input_tokens": 1800, "output_tokens": 350},
-    "aggressive_analyst": {"model_key": "risk_model", "calls": 1, "input_tokens": 1900, "output_tokens": 350},
-    "neutral_analyst": {"model_key": "risk_model", "calls": 1, "input_tokens": 1900, "output_tokens": 350},
-    "conservative_analyst": {"model_key": "risk_model", "calls": 1, "input_tokens": 1900, "output_tokens": 350},
-    "portfolio_manager": {"model_key": "manager_model", "calls": 1, "input_tokens": 1800, "output_tokens": 250},
-}
+
+def _fresh_llm_usage_state() -> dict:
+    return {
+        "calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "by_role": {},
+        "by_ticker": {},
+        "last_updated_at": None,
+    }
 
 
 def _fresh_stage_states() -> dict[str, dict]:
@@ -215,6 +206,7 @@ def _fresh_pipeline_state() -> dict:
         "stages": _fresh_stage_states(),
         "recent_events": [],
         "llm_settings": {},
+        "llm_usage": _fresh_llm_usage_state(),
         "discovery_context": {},
         "stop_requested": False,
         "stop_requested_at": None,
@@ -234,6 +226,256 @@ class SessionSchedule:
 
 class StopRequestedError(RuntimeError):
     pass
+
+
+def _coerce_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _normalize_model_name(model_name: Optional[str]) -> Optional[str]:
+    if not model_name:
+        return None
+    return model_name.strip().lower()
+
+
+def _extract_usage_from_llm_result(response: Any) -> dict[str, Any]:
+    model_name = None
+    input_tokens = 0
+    output_tokens = 0
+    total_tokens = 0
+
+    llm_output = getattr(response, "llm_output", None) or {}
+    token_usage = llm_output.get("token_usage") or llm_output.get("usage") or {}
+    model_name = llm_output.get("model_name") or llm_output.get("model")
+
+    generations = getattr(response, "generations", None) or []
+    message = None
+    if generations and generations[0]:
+        generation = generations[0][0]
+        message = getattr(generation, "message", generation)
+
+    if message is not None:
+        usage_metadata = getattr(message, "usage_metadata", None) or {}
+        response_metadata = getattr(message, "response_metadata", None) or {}
+        response_token_usage = response_metadata.get("token_usage") or {}
+        input_tokens = _coerce_int(
+            usage_metadata.get("input_tokens")
+            or response_token_usage.get("prompt_tokens")
+            or response_token_usage.get("input_tokens")
+            or token_usage.get("prompt_tokens")
+            or token_usage.get("input_tokens")
+        )
+        output_tokens = _coerce_int(
+            usage_metadata.get("output_tokens")
+            or response_token_usage.get("completion_tokens")
+            or response_token_usage.get("output_tokens")
+            or token_usage.get("completion_tokens")
+            or token_usage.get("output_tokens")
+        )
+        total_tokens = _coerce_int(
+            usage_metadata.get("total_tokens")
+            or response_token_usage.get("total_tokens")
+            or token_usage.get("total_tokens")
+        )
+        model_name = (
+            response_metadata.get("model_name")
+            or response_metadata.get("model")
+            or model_name
+        )
+
+    if total_tokens == 0:
+        total_tokens = input_tokens + output_tokens
+
+    return {
+        "model_name": model_name,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _record_pipeline_llm_usage(
+    role: str,
+    model_name: Optional[str],
+    input_tokens: int,
+    output_tokens: int,
+    total_tokens: int,
+    *,
+    ticker: Optional[str] = None,
+) -> None:
+    if input_tokens <= 0 and output_tokens <= 0 and total_tokens <= 0:
+        return
+
+    timestamp = _pipeline_now()
+    with _PIPELINE_STATE_LOCK:
+        llm_usage = _PIPELINE_STATE.setdefault("llm_usage", _fresh_llm_usage_state())
+        llm_usage["calls"] += 1
+        llm_usage["input_tokens"] += input_tokens
+        llm_usage["output_tokens"] += output_tokens
+        llm_usage["total_tokens"] += total_tokens or (input_tokens + output_tokens)
+        llm_usage["last_updated_at"] = timestamp
+
+        role_state = llm_usage["by_role"].setdefault(
+            role,
+            {
+                "model": model_name,
+                "calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+        )
+        role_state["model"] = model_name or role_state.get("model")
+        role_state["calls"] += 1
+        role_state["input_tokens"] += input_tokens
+        role_state["output_tokens"] += output_tokens
+        role_state["total_tokens"] += total_tokens or (input_tokens + output_tokens)
+
+        if ticker:
+            ticker_state = llm_usage["by_ticker"].setdefault(
+                ticker,
+                {
+                    "calls": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                    "roles": {},
+                },
+            )
+            ticker_state["calls"] += 1
+            ticker_state["input_tokens"] += input_tokens
+            ticker_state["output_tokens"] += output_tokens
+            ticker_state["total_tokens"] += total_tokens or (input_tokens + output_tokens)
+            ticker_role_state = ticker_state["roles"].setdefault(
+                role,
+                {
+                    "model": model_name,
+                    "calls": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+            )
+            ticker_role_state["model"] = model_name or ticker_role_state.get("model")
+            ticker_role_state["calls"] += 1
+            ticker_role_state["input_tokens"] += input_tokens
+            ticker_role_state["output_tokens"] += output_tokens
+            ticker_role_state["total_tokens"] += total_tokens or (input_tokens + output_tokens)
+
+    _publish_pipeline_event(
+        "usage_updated",
+        f"Usage updated for {role}.",
+        role=role,
+        ticker=ticker,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+    )
+
+
+class _PipelineUsageCollector:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._current_ticker: Optional[str] = None
+
+    def set_current_ticker(self, ticker: Optional[str]) -> None:
+        with self._lock:
+            self._current_ticker = ticker
+
+    def current_ticker(self) -> Optional[str]:
+        with self._lock:
+            return self._current_ticker
+
+    def build_handler(self, role: str, model_name: str) -> BaseCallbackHandler:
+        return _PipelineUsageCallbackHandler(self, role=role, model_name=model_name)
+
+
+class _PipelineUsageCallbackHandler(BaseCallbackHandler):
+    def __init__(self, collector: _PipelineUsageCollector, role: str, model_name: str) -> None:
+        self.collector = collector
+        self.role = role
+        self.model_name = model_name
+
+    def on_llm_end(self, response, **kwargs) -> Any:
+        usage = _extract_usage_from_llm_result(response)
+        _record_pipeline_llm_usage(
+            self.role,
+            usage.get("model_name") or self.model_name,
+            usage.get("input_tokens", 0),
+            usage.get("output_tokens", 0),
+            usage.get("total_tokens", 0),
+            ticker=self.collector.current_ticker(),
+        )
+
+
+def _fetch_openrouter_pricing_map() -> dict[str, dict[str, float]]:
+    now = time.time()
+    with _OPENROUTER_PRICING_CACHE_LOCK:
+        cached_at = _OPENROUTER_PRICING_CACHE["fetched_at"]
+        if _OPENROUTER_PRICING_CACHE["models"] and (now - cached_at) < _OPENROUTER_PRICING_TTL_SECONDS:
+            return dict(_OPENROUTER_PRICING_CACHE["models"])
+
+    response = requests.get("https://openrouter.ai/api/v1/models", timeout=20)
+    response.raise_for_status()
+    payload = response.json()
+    models = {}
+    for item in payload.get("data", []):
+        pricing = item.get("pricing") or {}
+        prompt = pricing.get("prompt")
+        completion = pricing.get("completion")
+        if prompt is None or completion is None:
+            continue
+        try:
+            prompt_usd = float(prompt)
+            completion_usd = float(completion)
+        except (TypeError, ValueError):
+            continue
+        for key in (item.get("id"), item.get("canonical_slug")):
+            normalized = _normalize_model_name(key)
+            if not normalized:
+                continue
+            models[normalized] = {
+                "input_per_token_usd": prompt_usd,
+                "output_per_token_usd": completion_usd,
+            }
+
+    with _OPENROUTER_PRICING_CACHE_LOCK:
+        _OPENROUTER_PRICING_CACHE["fetched_at"] = now
+        _OPENROUTER_PRICING_CACHE["models"] = dict(models)
+    return models
+
+
+def _resolve_live_model_pricing(provider: Optional[str], model_name: Optional[str]) -> tuple[Optional[dict[str, float]], Optional[str]]:
+    normalized = _normalize_model_name(model_name)
+    if not normalized or provider != "openrouter":
+        return None, None
+
+    try:
+        pricing_map = _fetch_openrouter_pricing_map()
+    except Exception as exc:
+        logger.warning("Could not refresh OpenRouter pricing: %s", exc)
+        return None, None
+
+    pricing = pricing_map.get(normalized)
+    if pricing is None and "/" not in normalized:
+        for prefix in ("openai/", "google/", "anthropic/"):
+            pricing = pricing_map.get(f"{prefix}{normalized}")
+            if pricing is not None:
+                break
+    if pricing is None:
+        return None, None
+    return pricing, "openrouter_models_api"
+
+
+def _calculate_actual_cost_usd(provider: Optional[str], model_name: Optional[str], input_tokens: int, output_tokens: int) -> tuple[Optional[float], Optional[str]]:
+    pricing, source = _resolve_live_model_pricing(provider, model_name)
+    if pricing is None:
+        return None, None
+    cost = (input_tokens * pricing["input_per_token_usd"]) + (output_tokens * pricing["output_per_token_usd"])
+    return cost, source
 
 
 def _pipeline_now() -> str:
@@ -259,89 +501,75 @@ def _duration_seconds(started_at: Optional[str], finished_at: Optional[str] = No
     return max(duration, 0.0)
 
 
-def _normalize_model_name(model_name: Optional[str]) -> Optional[str]:
-    if not model_name:
-        return None
-    return model_name.strip().lower()
-
-
-def _estimate_model_cost_usd(model_name: Optional[str], input_tokens: int, output_tokens: int) -> float:
-    normalized = _normalize_model_name(model_name)
-    if not normalized:
-        return 0.0
-    if normalized.endswith(":free"):
-        return 0.0
-
-    pricing = _MODEL_PRICING_PER_1M_TOKENS_USD.get(normalized)
-    if pricing is None and "/" not in normalized:
-        pricing = _MODEL_PRICING_PER_1M_TOKENS_USD.get(f"openai/{normalized}")
-    if pricing is None and "/" not in normalized:
-        pricing = _MODEL_PRICING_PER_1M_TOKENS_USD.get(f"google/{normalized}")
-    if pricing is None and "/" not in normalized:
-        pricing = _MODEL_PRICING_PER_1M_TOKENS_USD.get(f"anthropic/{normalized}")
-    if pricing is None:
-        return 0.0
-
-    return (
-        (input_tokens / 1_000_000.0) * pricing["input"]
-        + (output_tokens / 1_000_000.0) * pricing["output"]
-    )
-
-
-def _estimate_selection_cost_usd(pipeline_state: dict) -> float:
-    discovery = pipeline_state.get("discovery_context") or {}
-    ranked_count = len(discovery.get("ranked_symbols") or [])
-    if ranked_count == 0 or not discovery.get("universe_mode") == "sp500":
-        return 0.0
-
-    assumption = _RUN_COST_ROLE_ASSUMPTIONS["selection"]
-    llm_settings = pipeline_state.get("llm_settings") or {}
-    model_name = llm_settings.get(assumption["model_key"])
-    return _estimate_model_cost_usd(
-        model_name,
-        input_tokens=assumption["input_tokens"],
-        output_tokens=assumption["output_tokens"],
-    )
-
-
-def _estimate_per_ticker_cost_usd(llm_settings: dict) -> tuple[float, list[dict]]:
-    breakdown = []
-    total = 0.0
-    for role, assumption in _RUN_COST_ROLE_ASSUMPTIONS.items():
-        if role == "selection":
-            continue
-        model_name = llm_settings.get(assumption["model_key"])
-        role_cost = assumption["calls"] * _estimate_model_cost_usd(
-            model_name,
-            input_tokens=assumption["input_tokens"],
-            output_tokens=assumption["output_tokens"],
-        )
-        breakdown.append(
-            {
-                "role": role,
-                "model": model_name,
-                "estimated_cost_usd": round(role_cost, 6),
-            }
-        )
-        total += role_cost
-    return total, breakdown
-
-
 def _build_pipeline_telemetry(pipeline_state: dict) -> dict:
+    provider = (pipeline_state.get("llm_settings") or {}).get("provider")
+    llm_usage = pipeline_state.get("llm_usage") or {}
     llm_settings = pipeline_state.get("llm_settings") or {}
     tickers = pipeline_state.get("tickers") or []
-    completed_tickers = [
-        ticker for ticker in tickers if ticker.get("status") in {"completed", "failed", "skipped", "stopped"}
-    ]
-    pending_tickers = [
-        ticker for ticker in tickers if ticker.get("status") in {"pending", "running"}
-    ]
+    by_role = llm_usage.get("by_role") or {}
+    by_ticker = llm_usage.get("by_ticker") or {}
 
-    selection_cost = _estimate_selection_cost_usd(pipeline_state)
-    per_ticker_cost, role_breakdown = _estimate_per_ticker_cost_usd(llm_settings)
-    completed_cost = selection_cost + (len(completed_tickers) * per_ticker_cost)
-    total_estimated_cost = selection_cost + (len(tickers) * per_ticker_cost)
-    remaining_cost = len(pending_tickers) * per_ticker_cost
+    role_breakdown = []
+    actual_cost_values: list[float] = []
+    missing_price_for_recorded_usage = False
+    selection_cost: Optional[float] = None
+    pricing_source: Optional[str] = None
+
+    for role, summary in by_role.items():
+        role_cost, source = _calculate_actual_cost_usd(
+            provider,
+            summary.get("model") or llm_settings.get(f"{role}_model"),
+            _coerce_int(summary.get("input_tokens")),
+            _coerce_int(summary.get("output_tokens")),
+        )
+        if role_cost is None:
+            missing_price_for_recorded_usage = True
+        else:
+            actual_cost_values.append(role_cost)
+            pricing_source = pricing_source or source
+        role_breakdown.append(
+            {
+                "role": role,
+                "model": summary.get("model"),
+                "calls": _coerce_int(summary.get("calls")),
+                "input_tokens": _coerce_int(summary.get("input_tokens")),
+                "output_tokens": _coerce_int(summary.get("output_tokens")),
+                "total_tokens": _coerce_int(summary.get("total_tokens")),
+                "actual_cost_usd": None if role_cost is None else round(role_cost, 6),
+            }
+        )
+        if role == "selection":
+            selection_cost = role_cost
+
+    completed_cost = None if missing_price_for_recorded_usage else round(sum(actual_cost_values), 6)
+
+    ticker_durations = {}
+    for ticker in tickers:
+        ticker_usage = by_ticker.get(ticker["symbol"], {})
+        ticker_cost_values: list[float] = []
+        ticker_missing_price = False
+        for summary in (ticker_usage.get("roles") or {}).values():
+            role_cost, _ = _calculate_actual_cost_usd(
+                provider,
+                summary.get("model"),
+                _coerce_int(summary.get("input_tokens")),
+                _coerce_int(summary.get("output_tokens")),
+            )
+            if role_cost is None:
+                ticker_missing_price = True
+            else:
+                ticker_cost_values.append(role_cost)
+        ticker_durations[ticker["symbol"]] = {
+            "duration_seconds": _duration_seconds(
+                ticker.get("started_at"),
+                ticker.get("finished_at"),
+            ),
+            "actual_cost_usd": None if ticker_missing_price else round(sum(ticker_cost_values), 6),
+            "calls": _coerce_int(ticker_usage.get("calls")),
+            "input_tokens": _coerce_int(ticker_usage.get("input_tokens")),
+            "output_tokens": _coerce_int(ticker_usage.get("output_tokens")),
+            "total_tokens": _coerce_int(ticker_usage.get("total_tokens")),
+        }
 
     stage_durations = {}
     for stage_key, stage_state in (pipeline_state.get("stages") or {}).items():
@@ -353,30 +581,22 @@ def _build_pipeline_telemetry(pipeline_state: dict) -> dict:
             ),
         }
 
-    ticker_durations = {}
-    for ticker in tickers:
-        ticker_durations[ticker["symbol"]] = {
-            "duration_seconds": _duration_seconds(
-                ticker.get("started_at"),
-                ticker.get("finished_at"),
-            ),
-            "estimated_cost_usd": round(per_ticker_cost, 6),
-        }
-
     return {
         "run_duration_seconds": _duration_seconds(
             pipeline_state.get("started_at"),
             pipeline_state.get("finished_at"),
         ),
-        "selection_estimated_cost_usd": round(selection_cost, 6),
-        "per_ticker_estimated_cost_usd": round(per_ticker_cost, 6),
-        "completed_estimated_cost_usd": round(completed_cost, 6),
-        "remaining_estimated_cost_usd": round(remaining_cost, 6),
-        "total_estimated_cost_usd": round(total_estimated_cost, 6),
+        "selection_actual_cost_usd": None if selection_cost is None else round(selection_cost, 6),
+        "completed_actual_cost_usd": completed_cost,
+        "final_actual_cost_usd": completed_cost if pipeline_state.get("status") in {"completed", "failed", "stopped", "skipped"} else None,
+        "input_tokens": _coerce_int(llm_usage.get("input_tokens")),
+        "output_tokens": _coerce_int(llm_usage.get("output_tokens")),
+        "total_tokens": _coerce_int(llm_usage.get("total_tokens")),
         "stage_durations": stage_durations,
         "ticker_durations": ticker_durations,
         "role_cost_breakdown": role_breakdown,
-        "cost_basis": "heuristic_token_estimate",
+        "pricing_source": pricing_source,
+        "cost_basis": "actual_usage_live_pricing" if pricing_source else "actual_usage_only",
     }
 
 
@@ -1033,6 +1253,7 @@ def _select_market_candidates(
     ranked_candidates: list[dict],
     held_symbols: list[str],
     trade_date: str,
+    usage_collector: Optional[_PipelineUsageCollector] = None,
 ) -> dict:
     target_count = _get_env_int("SCREEN_TOP_N", 8)
     if not ranked_candidates:
@@ -1063,6 +1284,7 @@ def _select_market_candidates(
             trade_date=trade_date,
             llm_settings=selector_settings,
             selection_count=min(target_count, len(ranked_candidates)),
+            callbacks=[usage_collector.build_handler("selection", selector_settings["quick_model"])] if usage_collector else None,
         )
         selection["agentic_selection_enabled"] = True
         return selection
@@ -1085,7 +1307,11 @@ def _merge_ticker_lists(primary: list[str], secondary: list[str]) -> list[str]:
     return merged
 
 
-def _resolve_analysis_tickers(executor, trade_date: str) -> tuple[list[str], dict]:
+def _resolve_analysis_tickers(
+    executor,
+    trade_date: str,
+    usage_collector: Optional[_PipelineUsageCollector] = None,
+) -> tuple[list[str], dict]:
     universe_mode = (_get_env_str("UNIVERSE_MODE", "fixed") or "fixed").lower()
     explicit_tickers = _get_explicit_tickers()
 
@@ -1109,7 +1335,12 @@ def _resolve_analysis_tickers(executor, trade_date: str) -> tuple[list[str], dic
             f"Ranked {len(ranked_candidates)} candidates from S&P 500 universe.",
         )
         _set_pipeline_stage("selection", "running", "Running agentic shortlist selection.")
-        selection = _select_market_candidates(ranked_candidates, held_symbols, trade_date)
+        selection = _select_market_candidates(
+            ranked_candidates,
+            held_symbols,
+            trade_date,
+            usage_collector=usage_collector,
+        )
         selected_candidates = selection.get("selected_candidates", ranked_candidates)
         candidate_symbols = [item["symbol"] for item in selected_candidates]
         tickers = _merge_ticker_lists(held_symbols, candidate_symbols)
@@ -1239,12 +1470,19 @@ def _build_ta_config() -> dict:
     return cfg
 
 
-def _run_analysis(ticker: str, trade_date: str, run_id: str) -> str:
+def _run_analysis(
+    ticker: str,
+    trade_date: str,
+    run_id: str,
+    usage_collector: Optional[_PipelineUsageCollector] = None,
+) -> str:
     """Run full TradingAgentsGraph and return processed signal string."""
     from tradingagents.graph.trading_graph import TradingAgentsGraph
 
     cfg = _build_ta_config()
     cfg["log_file_suffix"] = run_id
+    if usage_collector is not None:
+        cfg["llm_callback_factory"] = usage_collector.build_handler
     ta = TradingAgentsGraph(
         debug=False,
         config=cfg,
@@ -1579,12 +1817,17 @@ def _execute_trading_job(
     run_id = _build_run_id(today, session_name, started_at)
     llm_settings = _resolve_llm_settings()
     _reset_pipeline_state(run_id, session_name, trigger_source, llm_settings)
+    usage_collector = _PipelineUsageCollector()
 
     executor = AlpacaExecutor()
     notifier = TelegramNotifier()
     executor.reset_session_guard()
     _raise_if_stop_requested()
-    tickers, discovery_context = _resolve_analysis_tickers(executor, today)
+    tickers, discovery_context = _resolve_analysis_tickers(
+        executor,
+        today,
+        usage_collector=usage_collector,
+    )
     _set_pipeline_discovery_context(discovery_context)
     if not tickers:
         logger.warning("No tickers resolved for this run; aborting.")
@@ -1651,7 +1894,8 @@ def _execute_trading_job(
         )
         for attempt in range(retries):
             try:
-                signal = _run_analysis(ticker, today, run_id)
+                usage_collector.set_current_ticker(ticker)
+                signal = _run_analysis(ticker, today, run_id, usage_collector=usage_collector)
                 logger.info("Signal for %s: %s", ticker, signal)
                 break
             except Exception as exc:
@@ -1667,6 +1911,8 @@ def _execute_trading_job(
                 if attempt < retries - 1:
                     _raise_if_stop_requested()
                     time.sleep(3 * (attempt + 1))
+            finally:
+                usage_collector.set_current_ticker(None)
 
         _raise_if_stop_requested()
 

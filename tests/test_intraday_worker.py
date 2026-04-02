@@ -143,7 +143,7 @@ class TestIntradayWorkerHelpers(unittest.TestCase):
         self.assertEqual(payload["pipeline"]["stages"]["analysis"]["status"], "running")
         self.assertEqual(payload["pipeline"]["llm_settings"]["selection_model"], "mini")
         self.assertIn("telemetry", payload["pipeline"])
-        self.assertIn("total_estimated_cost_usd", payload["pipeline"]["telemetry"])
+        self.assertIn("completed_actual_cost_usd", payload["pipeline"]["telemetry"])
 
     def test_dashboard_route_serves_html(self):
         server = worker._build_http_server("127.0.0.1", 0)
@@ -231,8 +231,9 @@ class TestIntradayWorkerHelpers(unittest.TestCase):
         self.assertEqual(config["role_llm_models"]["aggressive_analyst"], "risk")
         self.assertEqual(config["role_llm_models"]["portfolio_manager"], "manager")
 
-    def test_build_pipeline_telemetry_exposes_duration_and_cost_estimates(self):
+    def test_build_pipeline_telemetry_exposes_actual_usage_and_live_pricing(self):
         pipeline_state = {
+            "status": "running",
             "started_at": "2026-04-01T14:00:00+00:00",
             "finished_at": "2026-04-01T14:10:00+00:00",
             "tickers": [
@@ -262,6 +263,7 @@ class TestIntradayWorkerHelpers(unittest.TestCase):
                 },
             },
             "llm_settings": {
+                "provider": "openrouter",
                 "selection_model": "openai/gpt-5.4-mini",
                 "analyst_model": "google/gemini-3.1-flash-lite-preview",
                 "fundamentals_model": "google/gemini-3.1-pro-preview",
@@ -270,19 +272,71 @@ class TestIntradayWorkerHelpers(unittest.TestCase):
                 "risk_model": "openai/gpt-5.4-mini",
                 "manager_model": "openai/gpt-5.4-mini",
             },
-            "discovery_context": {
-                "universe_mode": "sp500",
-                "ranked_symbols": ["MSFT", "NVDA", "AAPL"],
+            "llm_usage": {
+                "calls": 3,
+                "input_tokens": 600,
+                "output_tokens": 150,
+                "total_tokens": 750,
+                "by_role": {
+                    "selection": {
+                        "model": "openai/gpt-5.4-mini",
+                        "calls": 1,
+                        "input_tokens": 100,
+                        "output_tokens": 20,
+                        "total_tokens": 120,
+                    },
+                    "market": {
+                        "model": "google/gemini-3.1-flash-lite-preview",
+                        "calls": 2,
+                        "input_tokens": 500,
+                        "output_tokens": 130,
+                        "total_tokens": 630,
+                    },
+                },
+                "by_ticker": {
+                    "MSFT": {
+                        "calls": 2,
+                        "input_tokens": 500,
+                        "output_tokens": 130,
+                        "total_tokens": 630,
+                        "roles": {
+                            "market": {
+                                "model": "google/gemini-3.1-flash-lite-preview",
+                                "calls": 2,
+                                "input_tokens": 500,
+                                "output_tokens": 130,
+                                "total_tokens": 630,
+                            }
+                        },
+                    }
+                },
             },
         }
 
-        telemetry = worker._build_pipeline_telemetry(pipeline_state)
+        with patch.object(
+            worker,
+            "_fetch_openrouter_pricing_map",
+            return_value={
+                "openai/gpt-5.4-mini": {
+                    "input_per_token_usd": 0.000003,
+                    "output_per_token_usd": 0.000015,
+                },
+                "google/gemini-3.1-flash-lite-preview": {
+                    "input_per_token_usd": 0.0000001,
+                    "output_per_token_usd": 0.0000004,
+                },
+            },
+        ):
+            telemetry = worker._build_pipeline_telemetry(pipeline_state)
 
         self.assertEqual(telemetry["run_duration_seconds"], 600.0)
-        self.assertGreater(telemetry["total_estimated_cost_usd"], 0.0)
-        self.assertGreater(telemetry["remaining_estimated_cost_usd"], 0.0)
+        self.assertEqual(telemetry["input_tokens"], 600)
+        self.assertEqual(telemetry["output_tokens"], 150)
+        self.assertGreater(telemetry["completed_actual_cost_usd"], 0.0)
+        self.assertIsNone(telemetry["final_actual_cost_usd"])
         self.assertEqual(telemetry["stage_durations"]["analysis"]["duration_seconds"], 420.0)
         self.assertEqual(telemetry["ticker_durations"]["MSFT"]["duration_seconds"], 240.0)
+        self.assertGreater(telemetry["ticker_durations"]["MSFT"]["actual_cost_usd"], 0.0)
 
     def test_health_payload_is_flat_and_stable(self):
         with patch.object(

@@ -72,7 +72,7 @@ function renderTickers(pipeline) {
       <p class="ticker-meta">signal: ${ticker.signal || "-"}</p>
       <p class="ticker-meta">action: ${ticker.action || "-"}</p>
       <p class="ticker-meta">duration: ${formatDuration(telemetry[ticker.symbol]?.duration_seconds)}</p>
-      <p class="ticker-meta">est. cost: ${formatUsd(telemetry[ticker.symbol]?.estimated_cost_usd)}</p>
+      <p class="ticker-meta">cost: ${formatUsd(telemetry[ticker.symbol]?.actual_cost_usd)}</p>
     </article>
   `).join("");
 }
@@ -119,9 +119,9 @@ function renderPipeline(payload) {
   setText("discovery-reason", pipeline.discovery_context?.selection_reason || "-");
   setText("pipeline-totals", `${pipeline.tickers_completed || 0} / ${pipeline.tickers_total || 0} tickers completed`);
   setText("telemetry-run-duration", formatDuration(pipeline.telemetry?.run_duration_seconds));
-  setText("telemetry-completed-cost", formatUsd(pipeline.telemetry?.completed_estimated_cost_usd));
-  setText("telemetry-remaining-cost", formatUsd(pipeline.telemetry?.remaining_estimated_cost_usd));
-  setText("telemetry-total-cost", formatUsd(pipeline.telemetry?.total_estimated_cost_usd));
+  setText("telemetry-completed-cost", formatUsd(pipeline.telemetry?.completed_actual_cost_usd));
+  setText("telemetry-remaining-cost", pipeline.telemetry?.total_tokens ?? "-");
+  setText("telemetry-total-cost", formatUsd(pipeline.telemetry?.final_actual_cost_usd));
 
   const badge = document.getElementById("connection-badge");
   badge.textContent = status;

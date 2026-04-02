@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import json
 from datetime import date
-from typing import Dict, Any, Tuple, List, Optional
+from typing import Callable, Dict, Any, Tuple, List, Optional
 
 from langgraph.prebuilt import ToolNode
 
@@ -61,6 +61,7 @@ class TradingAgentsGraph:
         self.debug = debug
         self.config = config or DEFAULT_CONFIG
         self.callbacks = callbacks or []
+        self.llm_callback_factory: Optional[Callable[[str, str], Any]] = self.config.get("llm_callback_factory")
 
         # Update the interface's config
         set_config(self.config)
@@ -79,14 +80,29 @@ class TradingAgentsGraph:
             llm_kwargs["callbacks"] = self.callbacks
 
         self.deep_thinking_llm = self._create_llm(
-            self.config["deep_think_llm"], llm_kwargs
+            self.config["deep_think_llm"], llm_kwargs, role="deep"
         )
         self.quick_thinking_llm = self._create_llm(
-            self.config["quick_think_llm"], llm_kwargs
+            self.config["quick_think_llm"], llm_kwargs, role="quick"
         )
+        role_models = self.config.get("role_llm_models", {})
+        role_fallbacks = {
+            "market": self.config["quick_think_llm"],
+            "social": self.config["quick_think_llm"],
+            "news": self.config["quick_think_llm"],
+            "fundamentals": self.config["quick_think_llm"],
+            "bull_researcher": self.config["quick_think_llm"],
+            "bear_researcher": self.config["quick_think_llm"],
+            "research_manager": self.config["deep_think_llm"],
+            "trader": self.config["quick_think_llm"],
+            "aggressive_analyst": self.config["quick_think_llm"],
+            "neutral_analyst": self.config["quick_think_llm"],
+            "conservative_analyst": self.config["quick_think_llm"],
+            "portfolio_manager": self.config["deep_think_llm"],
+        }
         self.role_llms = {
-            role: self._create_llm(model, llm_kwargs)
-            for role, model in self.config.get("role_llm_models", {}).items()
+            role: self._create_llm(role_models.get(role, fallback_model), llm_kwargs, role=role)
+            for role, fallback_model in role_fallbacks.items()
         }
         
         # Initialize memories
@@ -129,12 +145,20 @@ class TradingAgentsGraph:
         # Set up the graph
         self.graph = self.graph_setup.setup_graph(selected_analysts)
 
-    def _create_llm(self, model: str, llm_kwargs: Dict[str, Any]):
+    def _create_llm(self, model: str, llm_kwargs: Dict[str, Any], role: str):
+        local_kwargs = dict(llm_kwargs)
+        callbacks = list(local_kwargs.get("callbacks", []))
+        if self.llm_callback_factory:
+            handler = self.llm_callback_factory(role, model)
+            if handler is not None:
+                callbacks.append(handler)
+        if callbacks:
+            local_kwargs["callbacks"] = callbacks
         client = create_llm_client(
             provider=self.config["llm_provider"],
             model=model,
             base_url=self.config.get("backend_url"),
-            **llm_kwargs,
+            **local_kwargs,
         )
         return client.get_llm()
 
